@@ -1,0 +1,17 @@
+task: "dtd_rag_wit"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "What type of object is in this photo?"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "wit/openai_ViT-B-32/index"
+    model_name: "openai/clip-vit-base-patch32"
+
+include: assets/_default_template_yaml

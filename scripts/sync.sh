@@ -26,6 +26,7 @@ main() {
         "/tests/"
     )
     workspace_exclude_patterns=(
+        ".env"
         ".cache"
         ".venv"
         ".pytest_cache"
@@ -37,6 +38,7 @@ main() {
         "/logs/"
         "/wandb/"
         "*.db"
+        "/notebooks/"
     )
 
     # Read remotes from configuration file

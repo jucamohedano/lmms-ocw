@@ -49,7 +49,7 @@ repos:
     hooks:
       - id: codespell
         args:
-          - --skip=data/**,logs/**,*.bib,*.csv,*.js
+          - --skip=data/**,logs/**,*.bib,*.csv,*.js,src/data/tasks/**
           - --ignore-words-list=ans,rouge
 
   # python docstring coverage checking

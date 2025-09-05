@@ -41,6 +41,7 @@ ACCELERATE_NUM_PROCESSES=$(
 
 EVAL_MODELS=""
 EVAL_MODELS_ARGS=""
+EVAL_BATCH_SIZE=1
 EVAL_OUTPUT_DIR=logs/schedule
 EVAL_TASKS=""
 EVAL_SAMPLES_LIMIT=""
@@ -57,6 +58,7 @@ main() {
         --tasks) EVAL_TASKS="$2"; shift 2 ;;
         --limit) EVAL_SAMPLES_LIMIT="$2"; shift 2 ;;
         --model-args|--models-args) EVAL_MODELS_ARGS="$2"; shift 2 ;;
+        --batch-size) EVAL_BATCH_SIZE="$2"; shift 2 ;;
         --no-samples) EVAL_SAMPLES_LOGGING=false; shift ;;
         --no-wandb) EVAL_WANDB_LOGGING=false; shift ;;
         -o|--output) EVAL_OUTPUT_DIR="$2"; shift 2 ;;
@@ -83,7 +85,7 @@ main() {
         for model in "${EVAL_MODELS[@]}"; do
 
             EVAL_EXTRA_ARGS=""
-            EVAL_EXTRA_ARGS="$EVAL_EXTRA_ARGS --batch_size 1"
+            EVAL_EXTRA_ARGS="$EVAL_EXTRA_ARGS --batch_size $EVAL_BATCH_SIZE"
             EVAL_EXTRA_ARGS="$EVAL_EXTRA_ARGS --output_path $EVAL_OUTPUT_DIR/$task/$model"
 
             if [ "$EVAL_MODELS_ARGS" ]; then

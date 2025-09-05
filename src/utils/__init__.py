@@ -1,3 +1,4 @@
+from src.utils._cased_transforms import default_vocabulary_transforms
 from src.utils._core_utils import (
     check_str_is_http,
     create_iterator,
@@ -69,4 +70,5 @@ __all__ = [
     "sanitize_model_name",
     "sanitize_task_name",
     "save_to_cache",
+    "default_vocabulary_transforms",
 ]

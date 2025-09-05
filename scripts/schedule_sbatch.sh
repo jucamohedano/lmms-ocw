@@ -54,6 +54,7 @@ SLURM_ERROR='./logs/slurm/%A_%a.err'
 
 EVAL_MODELS=""
 EVAL_MODELS_ARGS=""
+EVAL_BATCH_SIZE=1
 EVAL_OUTPUT_DIR=logs/schedule
 EVAL_TASKS=""
 EVAL_SAMPLES_LIMIT=""
@@ -80,6 +81,7 @@ main() {
             --tasks) EVAL_TASKS="$2"; shift 2;;
             --limit) EVAL_SAMPLES_LIMIT="$2"; shift 2;;
             --model-args|--models-args) EVAL_MODELS_ARGS="$2"; shift 2;;
+            --batch-size) EVAL_BATCH_SIZE="$2"; shift 2 ;;
             --no-samples) EVAL_SAMPLES_LOGGING=false; shift;;
             --no-wandb) EVAL_WANDB_LOGGING=false; shift;;
             -o|--output) EVAL_OUTPUT_DIR="$2"; shift 2 ;;
@@ -116,6 +118,12 @@ main() {
 #SBATCH --output=$SLURM_OUTPUT
 #SBATCH --error=$SLURM_ERROR
 
+module load nvhpc/24.5
+module load gcc/12.2.0
+
+export CC=gcc
+export CXX=g++
+
 # Pass env variables
 ACCELERATE_MAIN_PROCESS_PORT=\$((RANDOM % (50000 - 30000 + 1) + 30000))
 ACCELERATE_NUM_PROCESSES=\$(nvidia-smi --list-gpus | wc -l)
@@ -127,6 +135,9 @@ EVAL_SAMPLES_LIMIT=$EVAL_SAMPLES_LIMIT
 EVAL_SAMPLES_LOGGING=$EVAL_SAMPLES_LOGGING
 EVAL_WANDB_LOGGING=$EVAL_WANDB_LOGGING
 EVAL_WANDB_ARGS="$EVAL_WANDB_ARGS"
+
+# Ensure HuggingFace works offline
+export HF_HUB_OFFLINE=1
 
 # Split comma-separated values into array
 IFS=',' read -ra EVAL_MODELS_ARRAY <<< "\$EVAL_MODELS"
@@ -155,7 +166,7 @@ if [ -z "\$task" ] || [ -z "\$model" ]; then
 fi
 
 EVAL_EXTRA_ARGS=""
-EVAL_EXTRA_ARGS="\$EVAL_EXTRA_ARGS --batch_size 1"
+EVAL_EXTRA_ARGS="\$EVAL_EXTRA_ARGS --batch_size $EVAL_BATCH_SIZE"
 EVAL_EXTRA_ARGS="\$EVAL_EXTRA_ARGS --output_path \$EVAL_OUTPUT_DIR/\$task/\$model"
 
 if [ "\$EVAL_MODELS_ARGS" ]; then
