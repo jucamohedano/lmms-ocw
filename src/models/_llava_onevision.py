@@ -515,6 +515,8 @@ class LLaVAOnevision(Model):
             # TODO attention to this major generation step...
             if "image_aspect_ratio" in gen_kwargs:
                 gen_kwargs.pop("image_aspect_ratio")
+            if "rag" in gen_kwargs:
+                gen_kwargs.pop("rag")
 
             with torch.inference_mode():
                 cont = self.model.generate(

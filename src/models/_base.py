@@ -100,8 +100,8 @@ class Model(ABC):
         if len(kwargs.keys()) > 0:
             raise ValueError("kwargs are currently unsupported and unused in models.")
 
-        if batch_size != 1:
-            raise ValueError("Models currently only supports `batch_size=1`")
+        # if batch_size != 1:
+        #     raise ValueError("Models currently only supports `batch_size=1`")
 
         if distributed_types is None:
             raise ValueError("`distributed_types` must be passed to the base Model constructor!")

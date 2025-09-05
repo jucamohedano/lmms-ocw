@@ -1,5 +1,7 @@
 import base64
+import os
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -11,6 +13,7 @@ from src import utils
 from src.data.tasks import TaskInstance
 from src.models._api import register_model
 from src.models._base import Model
+from src.retrieval import Retriever
 
 __all__ = ["Qwen2VL"]
 
@@ -75,6 +78,7 @@ class Qwen2VL(Model):
         self._use_flash_attention_2 = use_flash_attention_2
         self._max_pixels = max_pixels
         self._min_pixels = min_pixels
+        self.batch_size_per_gpu = batch_size
 
         super().__init__(
             batch_size=batch_size,
@@ -140,6 +144,115 @@ class Qwen2VL(Model):
         """
         raise NotImplementedError
 
+    def _is_rag_enabled(self, gen_kwargs: dict) -> bool:
+        """Check if RAG is enabled in generation kwargs.
+
+        Args:
+        ----
+            gen_kwargs (dict): Generation keyword arguments.
+
+        """
+        rag = (gen_kwargs or {}).get("rag") or {}
+        return rag.get("enabled", False)
+
+    def _setup_rag(self, gen_kwargs: dict) -> None:
+        """Set up RAG retriever if not already set up.
+
+        Args:
+        ----
+            gen_kwargs (dict): Generation keyword arguments.
+
+        """
+        if hasattr(self, "_retriever"):
+            return
+
+        db_root = os.getenv("RAG_DATABASE_ROOT")
+        if not db_root:
+            log.warning(
+                "RAG is enabled but RAG_DATABASE_ROOT is not set; skipping retriever init."
+            )
+            return
+
+        rag = (gen_kwargs or {}).get("rag") or {}
+        self._retriever = Retriever(
+            Path(db_root) / rag.get("database_path"),
+            model_name=rag.get("model_name"),
+        )
+        log.info("Retrieval database loaded!")
+
+        if rag.get("format", "list-captions") == "cased":
+            self._vocab_transform = utils.default_vocabulary_transforms()
+
+    def _retrieve(self, gen_kwargs: dict, images: list[Image.Image]) -> None | list[dict]:
+        """Retrieve relevant data for each image using the retriever.
+
+        Args:
+        ----
+            gen_kwargs (dict): Generation keyword arguments.
+            images (list[Image.Image]): List of images to retrieve data for.
+
+        """
+        rag = (gen_kwargs or {}).get("rag") or {}
+        search_modality = rag.get("search_modality", "text")
+
+        if not hasattr(self, "_retriever"):
+            log.error("RAG is enabled but retriever is not set up.")
+            exit()
+
+        results_set = self._retriever.retrieve(
+            images,
+            input_type="image",
+            search_modality=search_modality,
+            num_samples=rag.get("num_samples", 10),
+        )
+
+        if results_set is None:
+            return None
+
+        if search_modality == "image":
+            raise NotImplementedError("Image search modality is not supported.")
+
+        elif search_modality == "text":
+            format = rag.get("format", "list-captions")
+            prompt = rag.get("prompt", "")
+
+            if format == "list-captions":
+                rag_data_set = []
+                for results in results_set:
+                    rag_data = [
+                        f"{idx + 1}. {result.get('caption')}" for idx, result in enumerate(results)
+                    ]
+                    rag_data = "\n".join(rag_data)
+                    rag_data_set.append(rag_data)
+
+            elif format == "cased":
+                rag_data_set = []
+                for results in results_set:
+                    captions = [result.get("caption") for result in results]
+                    vocabularies = self._vocab_transform(captions)
+                    words = list(set([vocab or ["object"] for vocab in vocabularies]))
+
+                    rag_data = ", ".join(words)
+                    rag_data_set.append(rag_data)
+
+            else:
+                raise NotImplementedError(f"RAG format '{format}' is not supported.")
+
+            # Format the prompt with the retrieved data for each sample
+            prompts = [prompt.format(rag_data) for rag_data in rag_data_set]
+
+            # Return a dictionary for each input sample
+            return [
+                {
+                    "type": "text",
+                    "text": prompt,
+                }
+                for prompt in prompts
+            ]
+
+        else:
+            raise NotImplementedError(f"Search modality '{search_modality}' is not supported.")
+
     def generate_until(self, requests: list[TaskInstance]) -> list[str]:
         """Generate greedily until a stopping sequence.
 
@@ -204,6 +317,13 @@ class Qwen2VL(Model):
             # This is safe to assume because the `grouper` object ensures it.
             gen_kwargs = all_gen_kwargs[0]
 
+            # RAG setup (guard-style, avoids deep nesting later)
+            rag_enabled = self._is_rag_enabled(gen_kwargs)
+            if rag_enabled:
+                rag = (gen_kwargs or {}).get("rag") or {}
+                rag_position = rag.get("position", "pre-sample")
+                self._setup_rag(gen_kwargs)
+
             # Set default values for until and max_new_tokens
             until = [self.tokenizer.decode(self.eot_token_id)]
 
@@ -225,6 +345,21 @@ class Qwen2VL(Model):
                 if "<image>" in batched_contexts[i]:
                     batched_contexts[i] = batched_contexts[i].replace("<image>", "")
 
+            # RAG optimization: pre-load all images and retrieve in batches
+            rag_messages = {}
+            if rag_enabled:
+                batched_visuals_for_rag = {}
+                for i, _ in enumerate(batched_contexts):
+                    visual = batched_visuals[i] if i < len(batched_visuals) else None
+                    if isinstance(visual, Image.Image):
+                        visual = visual.convert("RGB")
+                        batched_visuals_for_rag[i] = visual
+
+                # Batch retrieve data
+                retrieved_data = self._retrieve(gen_kwargs, list(batched_visuals_for_rag.values()))
+                for k, v in zip(batched_visuals_for_rag.keys(), retrieved_data, strict=False):
+                    rag_messages[k] = v
+
             messages = []
             for i, context in enumerate(batched_contexts):
                 if "<image>" in context:
@@ -240,18 +375,58 @@ class Qwen2VL(Model):
                         base64_image.save(buffer, format="JPEG")
                         base64_bytes = base64.b64encode(buffer.getvalue())
                         base64_string = base64_bytes.decode("utf-8")
+
+                        rag_message = None
+                        if rag_enabled:
+                            if i in rag_messages:
+                                rag_message = rag_messages[i]
+                            else:
+                                rag_message = self._retrieve(gen_kwargs, base64_image)[0]
+
+                        # Construct the message
+                        content = []
+
+                        # Retrieve using the image (guarded and concise)
+                        if (
+                            rag_enabled
+                            and rag_position == "pre-sample"
+                            and rag_message is not None
+                        ):
+                            content.append(rag_message)
+
+                        # When RAG is disabled, always include the image
+                        # When it is enabled, check the "include_image" flag (True by default)
+                        if not rag_enabled or rag.get("include_image", True):
+                            content.append(
+                                {
+                                    "type": "image",
+                                    "image": f"data:image/jpeg;base64,{base64_string}",
+                                }
+                            )
+
+                        if (
+                            rag_enabled
+                            and rag_position == "post-sample"
+                            and rag_message is not None
+                        ):
+                            content.append(rag_message)
+
+                        content.append({"type": "text", "text": context})
+
+                        if (
+                            rag_enabled
+                            and rag_position == "post-sample-and-query"
+                            and rag_message is not None
+                        ):
+                            content.append(rag_message)
+
                         message.append(
                             {
                                 "role": "user",
-                                "content": [
-                                    {
-                                        "type": "image",
-                                        "image": f"data:image/jpeg;base64,{base64_string}",
-                                    },
-                                    {"type": "text", "text": context},
-                                ],
+                                "content": content,
                             }
                         )
+
                     elif isinstance(visual, list | tuple) and all(
                         isinstance(v, Image.Image) for v in visual
                     ):  # Multiple images

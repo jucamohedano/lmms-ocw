@@ -1,0 +1,18 @@
+task: "eurosat_rag"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "What type of object is in this photo?"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "cc12m/openai_ViT-B-32/index"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "These captions have been retrieved because they best describe the image. Use them as additional context.\n{}"
+
+include: assets/_default_template_yaml

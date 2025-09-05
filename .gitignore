@@ -161,3 +161,10 @@ dmypy.json
 
 # HPC
 /slurm/
+
+# Configs
+config-diff.json
+
+# Ignore
+notebooks/
+.ignore
