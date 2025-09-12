@@ -97,6 +97,7 @@ ignore-init-method = true
 ignore-magic = true
 ignore-module = true
 ignore-nested-functions = true
+exclude = ["src/models/_phi3v_*.py"]
 
 [tool.pytest.ini_options]
 cache_dir = "~/.cache/pytest"
@@ -146,6 +147,10 @@ unfixable = []
 "src/agents/*.py" = ["UP"]
 "*.ipynb" = ["E501", "I", "ANN", "S", "G004", "T20"]
 "eval_*.py" = ["T201"]
+"src/models/_phi3v_*.py" = ["ALL"]
 
 [tools.setuptools.dynamic]
 version = {attr = "src.__version__"}
+
+[tool.bandit]
+exclude_dirs = ["src/models/_phi3v_*.py"]

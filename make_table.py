@@ -20,7 +20,25 @@ def get_args():
 
 def load_results(experiment_name: str, model: str):
     # Scan for folders of experiments and sort them by name
+    _all = False
+    if experiment_name == "all":
+        experiment_name = ""
+        _all = True
     folders = sorted(glob.glob(f"logs/schedule/*{experiment_name}/{model}"))
+
+    # Keep only the base experiments if no specific experiment name is given and not loading all
+    if not _all and len(experiment_name) == 0 and len(folders) > 0:
+        # Folders have this structure: logs/schedule/{experiment}[_other_stuff]/{model}
+        # Group them by "{experiment}" part
+        experiment_names = {Path(x).parent.name: x for x in folders}
+        experiments = []
+        for exp in experiment_names:
+            # If the previous experiment name is contained in the current one, skip it
+            if len(experiments) > 0 and experiments[-1] in exp:
+                continue
+            experiments.append(exp)
+
+        folders = [experiment_names[x] for x in experiments]
 
     # Prepare the data structure
     data = {
@@ -55,16 +73,21 @@ def load_results(experiment_name: str, model: str):
         with open(last_file) as f:
             experiment = json.load(f)
 
-        # Load the samples
-        with open(last_file_samples) as f:
-            samples = [json.loads(x) for x in f.readlines()]
+        experiment_name = list(experiment["results"].keys())[0]
 
-        # Compute LLaMa inclusion score
-        llama_inclusion_score = [x.get("textual_inclusion_llama32", 0) for x in samples]
-        llama_inclusion_score = sum(llama_inclusion_score) / len(llama_inclusion_score)
+        if "textual_inclusion_llama32,none" in experiment["results"][experiment_name]:
+            llama_inclusion_score = experiment["results"][experiment_name]["textual_inclusion_llama32,none"]
+
+        else:
+            # Load the samples
+            with open(last_file_samples) as f:
+                samples = [json.loads(x) for x in f.readlines()]
+
+            # Compute LLaMa inclusion score
+            llama_inclusion_score = [x.get("textual_inclusion_llama32", 0) for x in samples]
+            llama_inclusion_score = sum(llama_inclusion_score) / len(llama_inclusion_score)
 
         # Store results
-        experiment_name = list(experiment["results"].keys())[0]
         data["experiment"].append(experiment_name)
         data["concept_semantic_similarity"].append(
             experiment["results"][experiment_name]["concept_semantic_similarity,none"]
@@ -93,6 +116,10 @@ def make_latex(data: pd.DataFrame, key: str) -> str:
             values.append(f"{float(v) * 100:.1f}")
         except Exception:
             values.append("-")
+
+    mean = data[key].mean()
+    values.append(f"{mean * 100:.1f}")
+
     return " & ".join(values)
 
 

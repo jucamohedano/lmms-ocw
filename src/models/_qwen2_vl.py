@@ -180,10 +180,11 @@ class Qwen2VL(Model):
         )
         log.info("Retrieval database loaded!")
 
-        if rag.get("format", "list-captions") == "cased":
-            self._vocab_transform = utils.default_vocabulary_transforms()
+        self._retriever.set_vocab_transform(rag)
 
-    def _retrieve(self, gen_kwargs: dict, images: list[Image.Image]) -> None | list[dict]:
+    def _retrieve(
+        self, gen_kwargs: dict, images: list[Image.Image]
+    ) -> None | list[list[dict[str, Any]]]:
         """Retrieve relevant data for each image using the retriever.
 
         Args:
@@ -192,66 +193,20 @@ class Qwen2VL(Model):
             images (list[Image.Image]): List of images to retrieve data for.
 
         """
-        rag = (gen_kwargs or {}).get("rag") or {}
-        search_modality = rag.get("search_modality", "text")
-
         if not hasattr(self, "_retriever"):
             log.error("RAG is enabled but retriever is not set up.")
             exit()
 
-        results_set = self._retriever.retrieve(
-            images,
-            input_type="image",
-            search_modality=search_modality,
-            num_samples=rag.get("num_samples", 10),
-        )
+        def prepare(image: Image.Image) -> str:
+            base64_image = image.convert("RGB")
+            buffer = BytesIO()
+            base64_image.save(buffer, format="JPEG")
+            base64_bytes = base64.b64encode(buffer.getvalue())
+            base64_string = base64_bytes.decode("utf-8")
 
-        if results_set is None:
-            return None
+            return base64_string
 
-        if search_modality == "image":
-            raise NotImplementedError("Image search modality is not supported.")
-
-        elif search_modality == "text":
-            format = rag.get("format", "list-captions")
-            prompt = rag.get("prompt", "")
-
-            if format == "list-captions":
-                rag_data_set = []
-                for results in results_set:
-                    rag_data = [
-                        f"{idx + 1}. {result.get('caption')}" for idx, result in enumerate(results)
-                    ]
-                    rag_data = "\n".join(rag_data)
-                    rag_data_set.append(rag_data)
-
-            elif format == "cased":
-                rag_data_set = []
-                for results in results_set:
-                    captions = [result.get("caption") for result in results]
-                    vocabularies = self._vocab_transform(captions)
-                    words = list(set([vocab or ["object"] for vocab in vocabularies]))
-
-                    rag_data = ", ".join(words)
-                    rag_data_set.append(rag_data)
-
-            else:
-                raise NotImplementedError(f"RAG format '{format}' is not supported.")
-
-            # Format the prompt with the retrieved data for each sample
-            prompts = [prompt.format(rag_data) for rag_data in rag_data_set]
-
-            # Return a dictionary for each input sample
-            return [
-                {
-                    "type": "text",
-                    "text": prompt,
-                }
-                for prompt in prompts
-            ]
-
-        else:
-            raise NotImplementedError(f"Search modality '{search_modality}' is not supported.")
+        return self._retriever.retrieve_and_prepare(gen_kwargs, images, prepare=prepare)
 
     def generate_until(self, requests: list[TaskInstance]) -> list[str]:
         """Generate greedily until a stopping sequence.
@@ -357,7 +312,7 @@ class Qwen2VL(Model):
 
                 # Batch retrieve data
                 retrieved_data = self._retrieve(gen_kwargs, list(batched_visuals_for_rag.values()))
-                for k, v in zip(batched_visuals_for_rag.keys(), retrieved_data, strict=False):
+                for k, v in zip(batched_visuals_for_rag.keys(), retrieved_data, strict=True):
                     rag_messages[k] = v
 
             messages = []
@@ -386,13 +341,13 @@ class Qwen2VL(Model):
                         # Construct the message
                         content = []
 
-                        # Retrieve using the image (guarded and concise)
+                        # Retrieved data goes at the beginning of the context
                         if (
                             rag_enabled
                             and rag_position == "pre-sample"
                             and rag_message is not None
                         ):
-                            content.append(rag_message)
+                            content.extend(rag_message)
 
                         # When RAG is disabled, always include the image
                         # When it is enabled, check the "include_image" flag (True by default)
@@ -404,21 +359,23 @@ class Qwen2VL(Model):
                                 }
                             )
 
+                        # Retrieved data goes after the image, before the query
                         if (
                             rag_enabled
                             and rag_position == "post-sample"
                             and rag_message is not None
                         ):
-                            content.append(rag_message)
+                            content.extend(rag_message)
 
                         content.append({"type": "text", "text": context})
 
+                        # Retrieved data goes at the end of the context
                         if (
                             rag_enabled
                             and rag_position == "post-sample-and-query"
                             and rag_message is not None
                         ):
-                            content.append(rag_message)
+                            content.extend(rag_message)
 
                         message.append(
                             {

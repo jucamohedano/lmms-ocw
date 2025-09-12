@@ -1,0 +1,23 @@
+task: "flowers102_rag_images_pre"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "What type of object is in this photo?"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "cc12m/openai_ViT-B-32/index"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "You are an intelligent assistant capable of generating accurate and detailed captions for images. You will be given some retrieved images and their keywords. The last image is the input image, others are retrieved examples to help you. Response the caption for the image directly, do not include any explanations or unrelated details.<images>Image: The following image.\nRetrieved_Image_Caption: {}"
+
+    search_modality: "image"
+    grab_data_type: "image"
+    position: "pre-sample"
+    format: "list-captions"
+    limit: 4
+include: assets/_default_template_yaml

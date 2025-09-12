@@ -34,7 +34,7 @@ repos:
     rev: "1.7.5"
     hooks:
       - id: bandit
-        args: ["-s", "B101,B301,B403,B404,B603"]
+        args: ["-s", "B101,B301,B403,B404,B603", "-c", "pyproject.toml"]
 
   # yaml formatting
   - repo: https://github.com/pre-commit/mirrors-prettier
