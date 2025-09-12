@@ -1,13 +1,18 @@
 import os
+from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor
+from PIL import Image
+from transformers import AutoModelForCausalLM
 
 from src import utils
 from src.data.tasks import TaskInstance
 from src.models._api import register_model
 from src.models._base import Model
+from src.retrieval import Retriever
+
+from ._phi3v_processor import Phi3VProcessor
 
 __all__ = ["Phi3v"]
 
@@ -100,7 +105,8 @@ class Phi3v(Model):
         self._model = AutoModelForCausalLM.from_pretrained(
             self._model_name_or_path, **model_kwargs
         )
-        self._processor = AutoProcessor.from_pretrained(
+        # Using fixed version from pull request rather than AutoProcessor
+        self._processor = Phi3VProcessor.from_pretrained(
             self._model_name_or_path, **processor_kwargs
         )
         self._processor.tokenizer.padding_side = "left"
@@ -125,6 +131,64 @@ class Phi3v(Model):
 
         """
         raise NotImplementedError
+
+    def _is_rag_enabled(self, gen_kwargs: dict) -> bool:
+        """Check if RAG is enabled in generation kwargs.
+
+        Args:
+        ----
+            gen_kwargs (dict): Generation keyword arguments.
+
+        """
+        rag = (gen_kwargs or {}).get("rag") or {}
+        return rag.get("enabled", False)
+
+    def _setup_rag(self, gen_kwargs: dict) -> None:
+        """Set up RAG retriever if not already set up.
+
+        Args:
+        ----
+            gen_kwargs (dict): Generation keyword arguments.
+
+        """
+        if hasattr(self, "_retriever"):
+            return
+
+        db_root = os.getenv("RAG_DATABASE_ROOT")
+        if not db_root:
+            log.warning(
+                "RAG is enabled but RAG_DATABASE_ROOT is not set; skipping retriever init."
+            )
+            return
+
+        rag = (gen_kwargs or {}).get("rag") or {}
+        self._retriever = Retriever(
+            Path(db_root) / rag.get("database_path"),
+            model_name=rag.get("model_name"),
+        )
+        log.info("Retrieval database loaded!")
+
+        self._retriever.set_vocab_transform(rag)
+
+    def _retrieve(
+        self, gen_kwargs: dict, images: list[Image.Image]
+    ) -> None | list[list[dict[str, Any]]]:
+        """Retrieve relevant data for each image using the retriever.
+
+        Args:
+        ----
+            gen_kwargs (dict): Generation keyword arguments.
+            images (list[Image.Image]): List of images to retrieve data for.
+
+        """
+        if not hasattr(self, "_retriever"):
+            log.error("RAG is enabled but retriever is not set up.")
+            exit()
+
+        def prepare(image: Image.Image) -> str:
+            raise NotImplementedError("RAG prepare function is not implemented yet.")
+
+        return self._retriever.retrieve_and_prepare(gen_kwargs, images, prepare=prepare)
 
     def generate_until(self, requests: list[TaskInstance]) -> list[str]:
         """Generate greedily until a stopping sequence.
@@ -167,7 +231,8 @@ class Phi3v(Model):
         reordered = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
         chunks = reordered.get_batched(n=self.batch_size, batch_fn=None)
 
-        pbar_kwargs = dict(total=len(requests), disable=self.rank != 0, desc="Model Responding")
+        num_iters = (len(requests) + self.batch_size - 1) // self.batch_size
+        pbar_kwargs = dict(total=num_iters, disable=self.rank != 0, desc="Model Responding")
         pbar = utils.get_progress_bar(**pbar_kwargs)
         for chunk in chunks:
             (
@@ -184,7 +249,6 @@ class Phi3v(Model):
                 batched_doc_to_visual[0](self.task_dict[task][split][ids])
                 for ids in batched_doc_id
             ]
-            batched_visuals = _flatten_list(batched_visuals)
 
             # Assume all gen kwargs in the batch are the same
             # This is safe to assume because the `grouper` object ensures it.
@@ -207,7 +271,45 @@ class Phi3v(Model):
             if isinstance(batched_contexts, tuple):
                 batched_contexts = list(batched_contexts)
 
+            # RAG setup (guard-style, avoids deep nesting later)
+            rag_enabled = self._is_rag_enabled(gen_kwargs)
+            if rag_enabled:
+                rag = (gen_kwargs or {}).get("rag") or {}
+                rag_position = rag.get("position", "pre-sample")
+                self._setup_rag(gen_kwargs)
+
+            # RAG optimization: pre-load all images and retrieve in batches
+            rag_messages = {}
+            if rag_enabled:
+                batched_visuals_for_rag = {}
+                for i, _ in enumerate(batched_contexts):
+                    visual = batched_visuals[i] if i < len(batched_visuals) else None
+                    if (
+                        visual is not None
+                        and len(visual) == 1
+                        and isinstance(visual[0], Image.Image)
+                    ):
+                        visual = visual[0].convert("RGB")
+                        batched_visuals_for_rag[i] = visual
+
+                # Batch retrieve data
+                retrieved_data = self._retrieve(gen_kwargs, list(batched_visuals_for_rag.values()))
+                for k, v in zip(batched_visuals_for_rag.keys(), retrieved_data, strict=True):
+                    rag_messages[k] = v
+
+            image_counter = 0
             for i in range(len(batched_contexts)):
+                rag_message = None
+                if rag_enabled:
+                    if i in rag_messages:
+                        rag_message = rag_messages[i]
+                    else:
+                        rag_message = self._retrieve(gen_kwargs, visual)[0]
+                    # Extract the text from the retrieved data, which is structured as a
+                    # list of one element (a dict) in a standard OpenAI-like conversation format
+                    rag_message = rag_message[0]["text"]
+
+                # Build the prompt with <image> tokens and RAG content, if any
                 if "<image>" in batched_contexts[i]:
                     query = "" + batched_contexts[i]
                     img_placeholder_count = 1
@@ -216,15 +318,70 @@ class Phi3v(Model):
                         img_placeholder_count += 1
                 else:
                     query = ""
-                    for placeholder_id in range(len(batched_visuals)):
-                        query += f"<|image_{placeholder_id+1}|>\n"
-                    query += batched_contexts[i]
+                    image_tokens = ""
+                    # Using `batched_visuals[i]` instead of `batched_visuals`
+                    # to support batching
+                    for _ in range(len(batched_visuals[i])):
+                        image_tokens += f"<|image_{image_counter+1}|>\n"
+                        image_counter += 1
+
+                    # When RAG is enabled and there is retrieved content, we can erase the original
+                    # query, and reconstruct it later by putting the retrieved content in the
+                    # right place
+                    query = image_tokens + batched_contexts[i]
+                    if rag_enabled and rag_message is not None:
+                        query = ""
+
+                    # Retrieved data goes at the beginning of the context
+                    if rag_enabled and rag_position == "pre-sample" and rag_message is not None:
+                        query = "".join(
+                            [
+                                rag_message,
+                                "\n\n",
+                                image_tokens,
+                                batched_contexts[i],
+                            ]
+                        )
+
+                    # Retrieved data goes after the image, before the query
+                    if rag_enabled and rag_position == "post-sample" and rag_message is not None:
+                        query = "".join(
+                            [
+                                image_tokens,
+                                "\n",
+                                rag_message,
+                                "\n\n",
+                                batched_contexts[i],
+                            ]
+                        )
+
+                    # Retrieved data goes at the end of the context
+                    if (
+                        rag_enabled
+                        and rag_position == "post-sample-and-query"
+                        and rag_message is not None
+                    ):
+                        query = "".join(
+                            [
+                                image_tokens,
+                                "\n",
+                                batched_contexts[i],
+                                "\n",
+                                rag_message,
+                            ]
+                        )
+
                 messages = [{"role": "user", "content": query}]
                 batched_contexts[i] = self.tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
 
-            context = batched_contexts[0]
+            # Moved here so that the number of visuals corresponds to the number of contexts
+            # and the code that inserts <image> tokens correctly sees the number of images
+            # associated to each context
+            batched_visuals = _flatten_list(batched_visuals)
+
+            context = batched_contexts
             input_ids = self.processor(
                 text=context, images=batched_visuals, return_tensors="pt"
             ).to(self.device, self.model.dtype)
@@ -245,22 +402,23 @@ class Phi3v(Model):
                 if self.tokenizer.pad_token_id is not None
                 else self.tokenizer.eod_id
             )
-            generate_ids = self.model.generate(
-                **input_ids,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=pad_token_id,
-                do_sample=gen_kwargs["temperature"] > 0,
-                temperature=gen_kwargs["temperature"],
-                top_p=gen_kwargs["top_p"],
-                num_beams=gen_kwargs["num_beams"],
-                max_new_tokens=gen_kwargs["max_new_tokens"],
-                use_cache=self._use_cache,
-            )
+            with torch.inference_mode():
+                generate_ids = self.model.generate(
+                    **input_ids,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=pad_token_id,
+                    do_sample=gen_kwargs["temperature"] > 0,
+                    temperature=gen_kwargs["temperature"],
+                    top_p=gen_kwargs["top_p"],
+                    num_beams=gen_kwargs["num_beams"],
+                    max_new_tokens=gen_kwargs["max_new_tokens"],
+                    use_cache=self._use_cache,
+                )
             generate_ids = generate_ids[:, input_ids["input_ids"].shape[1] :]
             response = self.processor.batch_decode(
                 generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0]
-            res.append(response)
+            )
+            res.extend(response)
             self.cache_hook.add_partial("generate_until", (context, gen_kwargs), response)
             pbar.update(1)
 
