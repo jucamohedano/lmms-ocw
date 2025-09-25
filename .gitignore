@@ -168,3 +168,4 @@ config-diff.json
 # Ignore
 notebooks/
 .ignore
+plots/

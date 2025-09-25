@@ -2,7 +2,7 @@ import copy
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
@@ -13,7 +13,8 @@ from packaging import version
 from PIL import Image
 
 from src import utils
-from src.data.tasks import TaskInstance
+from src.data.tasks import TaskInstance, TaskSingleOutput
+from src.data.tasks._manager import ConfigurableTask
 from src.models._api import register_model
 from src.models._base import Model
 from src.retrieval import Retriever
@@ -385,6 +386,7 @@ class LLaVAOnevision(Model):
         rag = (gen_kwargs or {}).get("rag") or {}
         self._retriever = Retriever(
             Path(db_root) / rag.get("database_path"),
+            format=rag.get("database_format", "faiss"),
             model_name=rag.get("model_name"),
         )
         log.info("Retrieval database loaded!")
@@ -393,7 +395,7 @@ class LLaVAOnevision(Model):
 
     def _retrieve(
         self, gen_kwargs: dict, images: list[Image.Image]
-    ) -> None | list[list[dict[str, Any]]]:
+    ) -> None | list[dict[str, Any]]:
         """Retrieve relevant data for each image using the retriever.
 
         Args:
@@ -406,10 +408,37 @@ class LLaVAOnevision(Model):
             log.error("RAG is enabled but retriever is not set up.")
             exit()
 
-        def prepare(image: Image.Image) -> str:
-            raise NotImplementedError("RAG prepare function is not implemented yet.")
+        def prepare(image: Image.Image) -> dict[str, Any]:
+            payload = {
+                "type": "image",
+                "image": image,
+            }
 
-        return self._retriever.retrieve_and_prepare(gen_kwargs, images, prepare=prepare)
+            return payload
+
+        def result_callback(
+            rag_data: list[dict[str, Any]], images: list | None
+        ) -> dict[str, list]:
+            # Keep only the text elements and add a placeholder for images if any
+            _rag_data = []
+            for elem in rag_data:
+                if elem.get("type") == "text":
+                    _rag_data.append(elem.get("text"))
+                elif elem.get("type") == "image" and images is not None:
+                    _rag_data.append("<images>")
+
+            return {
+                "rag_data": _rag_data,
+                "images": [x.get("image") for x in images] if images is not None else [],
+            }
+
+        result = self._retriever.retrieve_and_prepare(
+            gen_kwargs, images, prepare=prepare, result_callback=result_callback
+        )
+        assert isinstance(result, list), f"Expected list, got {type(result)}"
+        result = list(cast(list[dict[str, list]], result))
+
+        return result
 
     def generate_until(self, requests: list[TaskInstance]) -> list[str]:
         """Generate greedily until a stopping sequence.
@@ -447,15 +476,17 @@ class LLaVAOnevision(Model):
             tokens = self._tok_encode(x[0])
             return -len(tokens), x[0]
 
+        configurable_task: ConfigurableTask = requests[0].args[2].__self__
+
         # Group requests by their generation_kwargs, so that we don't try to execute, e.g., greedy
         # sampling and temp=0.8 sampling in the same batch.
         reordered = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
         chunks = reordered.get_batched(n=self.batch_size, batch_fn=None)
-        num_iters = (len(requests) + self.batch_size - 1) // self.batch_size
+        # num_iters = (len(requests) + self.batch_size - 1) // self.batch_size
 
         origin_image_aspect_ratio = getattr(self.config, "image_aspect_ratio", None)
 
-        pbar_kwargs = dict(total=num_iters, disable=self.rank != 0, desc="Model Responding")
+        pbar_kwargs = dict(total=len(requests), disable=self.rank != 0, desc="Model Responding")
         pbar = utils.get_progress_bar(**pbar_kwargs)
         for chunk in chunks:
             (
@@ -483,6 +514,9 @@ class LLaVAOnevision(Model):
             rag_enabled = self._is_rag_enabled(gen_kwargs)
             if rag_enabled:
                 rag = (gen_kwargs or {}).get("rag") or {}
+                rag["doc_to_target"] = configurable_task.doc_to_target
+                rag["doc_to_visual"] = configurable_task.doc_to_visual
+                rag["test_docs"] = configurable_task.test_docs
                 rag_position = rag.get("position", "pre-sample")
                 self._setup_rag(gen_kwargs)
 
@@ -506,7 +540,11 @@ class LLaVAOnevision(Model):
                     rag_messages[k] = v
 
             question_input = []
-            for visual, context in zip(batched_visuals, batched_contexts, strict=True):
+            _batched_visuals = []
+            for i, (visual, context) in enumerate(
+                zip(batched_visuals, batched_contexts, strict=True)
+            ):  # noqa: E501
+                _batched_visual_to_add = visual
                 wrong_aspect_ratio = self.config.image_aspect_ratio != origin_image_aspect_ratio
                 if origin_image_aspect_ratio is not None and wrong_aspect_ratio:
                     self.config.image_aspect_ratio = origin_image_aspect_ratio
@@ -544,9 +582,14 @@ class LLaVAOnevision(Model):
                         rag_message = rag_messages[i]
                     else:
                         rag_message = self._retrieve(gen_kwargs, visual)[0]
-                    # Extract the text from the retrieved data, which is structured as a
-                    # list of one element (a dict) in a standard OpenAI-like conversation format
-                    rag_message = rag_message[0]["text"]
+                    # Get the actual message and the images
+                    rag_message, rag_images = rag_message["rag_data"], rag_message["images"]
+
+                    # We're going multi-image within the same prompt here
+                    # if len(rag_images) > 0:
+                    #     self.config.image_aspect_ratio = getattr(
+                    #         gen_kwargs, "image_aspect_ratio", "pad"
+                    #     )
 
                 is_image_defined = image_tensor is not None and len(image_tensor) != 0
                 if is_image_defined and DEFAULT_IMAGE_TOKEN not in context:
@@ -569,45 +612,59 @@ class LLaVAOnevision(Model):
                 else:
                     conv = conv_templates[self._conv_template].copy()
 
-                # Retrieved data goes at the beginning of the context
-                if rag_enabled and rag_position == "pre-sample" and rag_message is not None:
-                    question = "".join(
-                        [
-                            rag_message,
-                            "\n",
-                            image_tokens,
-                            "\n",
-                            context,
-                        ]
+                # RAG is enabled
+                if rag_enabled and rag_message is not None:
+                    rag_message = "\n".join(rag_message).replace(
+                        "<images>", DEFAULT_IMAGE_TOKEN + "\n"
                     )
 
-                # Retrieved data goes after the image, before the query
-                if rag_enabled and rag_position == "post-sample" and rag_message is not None:
-                    question = "".join(
-                        [
-                            image_tokens,
-                            "\n",
-                            rag_message,
-                            "\n",
-                            context,
-                        ]
-                    )
+                    # Retrieved data goes at the beginning of the context
+                    if rag_position == "pre-sample":
+                        if len(rag_images) > 0:
+                            _batched_visual_to_add = rag_images + _batched_visual_to_add
 
-                # Retrieved data goes at the end of the context
-                if (
-                    rag_enabled
-                    and rag_position == "post-sample-and-query"
-                    and rag_message is not None
-                ):
-                    question = "".join(
-                        [
-                            image_tokens,
-                            "\n",
-                            context,
-                            "\n",
-                            rag_message,
-                        ]
-                    )
+                        question = "".join(
+                            [
+                                rag_message,
+                                "\n",
+                                image_tokens,
+                                "\n",
+                                context,
+                            ]
+                        )
+
+                    # Retrieved data goes after the image, before the query
+                    if rag_position == "post-sample":
+                        if len(rag_images) > 0:
+                            _batched_visual_to_add = _batched_visual_to_add + rag_images
+
+                        question = "".join(
+                            [
+                                image_tokens,
+                                "\n",
+                                rag_message,
+                                "\n",
+                                context,
+                            ]
+                        )
+
+                    # Retrieved data goes at the end of the context
+                    if rag_position == "post-sample-and-query":
+                        if len(rag_images) > 0:
+                            _batched_visual_to_add = _batched_visual_to_add + rag_images
+
+                        question = "".join(
+                            [
+                                image_tokens,
+                                "\n",
+                                context,
+                                "\n",
+                                rag_message,
+                            ]
+                        )
+
+                # Store the updated visuals (might have added RAG images)
+                _batched_visuals.append(_batched_visual_to_add)
 
                 if _is_json(question):  # Conversational question input
                     question = json.loads(question)
@@ -628,9 +685,13 @@ class LLaVAOnevision(Model):
                     prompt_question = conv.get_prompt()
                     question_input.append(prompt_question)
 
+            # Use the updated batched visuals (might have added RAG images)
+            images_per_request = [len(x) for x in _batched_visuals]
+            batched_visuals = _batched_visuals
+
             # Recreate the image tensor correctly, assuming there's only one visual per instance
             # Otherwise, one might just use batch size = 1
-            if self.batch_size > 1:
+            if self.batch_size > 1 or (rag_enabled and len(batched_visuals[0]) > 1):
                 image_tensor = process_images(
                     sum(batched_visuals, []), self.processor, self.config
                 )
@@ -669,7 +730,7 @@ class LLaVAOnevision(Model):
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
 
             gen_kwargs["image_sizes"] = [
-                visual[0].size for visual in batched_visuals if visual is not None
+                visual.size for visual in sum(batched_visuals, []) if visual is not None
             ]
 
             # These steps are not in LLaVA's original code, but are necessary for generation
@@ -682,7 +743,14 @@ class LLaVAOnevision(Model):
 
             # Assume each instance in the batch has an image
             # Solution from: https://github.com/LLaVA-VL/LLaVA-NeXT/issues/169#issuecomment-2357309833
-            modalities = ["image" for _ in range(len(batched_visuals))]
+            # modalities = ["image" for _ in range(len(batched_visuals))]
+            modalities = ["image"] * len(sum(batched_visuals, []))
+
+            # Remove functions from gen_kwargs["rag"] so that pickle doesn't complain
+            if rag_enabled:
+                rag.pop("doc_to_target")
+                rag.pop("doc_to_visual")
+                rag.pop("test_docs")
 
             with torch.inference_mode():
                 cont = self.model.generate(
@@ -697,10 +765,17 @@ class LLaVAOnevision(Model):
 
             text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
             text_outputs = [response.strip() for response in text_outputs]
-            res.extend(text_outputs)
+            for idx, (ans, context) in enumerate(zip(text_outputs, batched_contexts, strict=True)):
+                _ans = TaskSingleOutput(
+                    answer=ans,
+                    context=context,
+                    context_tokens_count=attention_masks[idx].sum(),
+                    num_images=images_per_request[idx],
+                )
+                res.append(_ans)
 
-            self.cache_hook.add_partial("generate_until", (context, gen_kwargs), text_outputs)
-            pbar.update(1)
+                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
+                pbar.update(1)
 
         # Reorder this group of results back to original unsorted form
         res = reordered.get_original(res)

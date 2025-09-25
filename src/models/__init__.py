@@ -9,6 +9,7 @@ from src.models._api import (
     register_model,
 )
 from src.models._base import Model
+from src.models._embedder_clip import EmbedderCLIP
 from src.models._idefics2 import Idefics2
 from src.models._instructblip import InstructBLIP
 from src.models._internvl2 import InternVL2
@@ -43,6 +44,7 @@ MODEL_TYPES: dict[str, Callable] = {
     "llava-onevision": LLaVAOnevision,
     "phi3v": Phi3v,
     "qwen2-vl": Qwen2VL,
+    "embedder-clip": EmbedderCLIP,
 }
 
 

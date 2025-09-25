@@ -1,0 +1,23 @@
+task: "caltech101_rag_images"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "What type of object is in this photo?"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "cc12m/openai_ViT-B-32/index"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "The following images are similar to the image you have to classify. Use them as context.\n<images>"
+
+    search_modality: "text"
+    grab_data_type: "image"
+    position: "pre-sample"
+    format: "no-text"
+    limit: 4
+include: assets/_default_template_yaml

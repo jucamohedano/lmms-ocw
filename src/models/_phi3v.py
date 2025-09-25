@@ -1,13 +1,14 @@
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from PIL import Image
 from transformers import AutoModelForCausalLM
 
 from src import utils
-from src.data.tasks import TaskInstance
+from src.data.tasks import TaskInstance, TaskSingleOutput
+from src.data.tasks._manager import ConfigurableTask
 from src.models._api import register_model
 from src.models._base import Model
 from src.retrieval import Retriever
@@ -164,6 +165,7 @@ class Phi3v(Model):
         rag = (gen_kwargs or {}).get("rag") or {}
         self._retriever = Retriever(
             Path(db_root) / rag.get("database_path"),
+            format=rag.get("database_format", "faiss"),
             model_name=rag.get("model_name"),
         )
         log.info("Retrieval database loaded!")
@@ -172,7 +174,7 @@ class Phi3v(Model):
 
     def _retrieve(
         self, gen_kwargs: dict, images: list[Image.Image]
-    ) -> None | list[list[dict[str, Any]]]:
+    ) -> None | list[dict[str, list]]:
         """Retrieve relevant data for each image using the retriever.
 
         Args:
@@ -185,10 +187,90 @@ class Phi3v(Model):
             log.error("RAG is enabled but retriever is not set up.")
             exit()
 
-        def prepare(image: Image.Image) -> str:
-            raise NotImplementedError("RAG prepare function is not implemented yet.")
+        def prepare(image: Image.Image) -> dict[str, Any]:
+            payload = {
+                "type": "image",
+                "image": image,
+            }
 
-        return self._retriever.retrieve_and_prepare(gen_kwargs, images, prepare=prepare)
+            return payload
+
+        def result_callback(
+            rag_data: list[dict[str, Any]], images: list | None
+        ) -> dict[str, list]:
+            # Keep only the text elements and add a placeholder for images if any
+            _rag_data = []
+            for elem in rag_data:
+                if elem.get("type") == "text":
+                    _rag_data.append(elem.get("text", ""))
+                elif elem.get("type") == "image" and images is not None:
+                    _rag_data.append("<images>")
+
+            return {
+                "rag_data": _rag_data,
+                "images": [x.get("image") for x in images] if images is not None else [],
+            }
+
+        result = self._retriever.retrieve_and_prepare(
+            gen_kwargs, images, prepare=prepare, result_callback=result_callback
+        )
+        assert isinstance(result, list), f"Expected list, got {type(result)}"
+        result = list(cast(list[dict[str, list]], result))
+
+        return result
+
+    def _prepare_image_tokens(
+        self, batched_visuals: list[Image.Image], start_counter: int, return_as_list: bool = False
+    ) -> tuple[str | list[str], int, int]:
+        """Prepare image tokens for the model.
+
+        Args:
+        ----
+            batched_visuals (list[Image.Image]): List of images to prepare tokens for.
+            start_counter (int): Starting counter for image tokens.
+            return_as_list (bool): Whether to return image tokens as a list. Defaults to False.
+
+        """
+        counter = start_counter
+
+        if return_as_list:
+            image_tokens = []
+            for _ in range(len(batched_visuals)):
+                image_tokens.append(f"<|image_{counter+1}|>")
+                counter += 1
+        else:
+            image_tokens = ""
+            for _ in range(len(batched_visuals)):
+                image_tokens += f"<|image_{counter+1}|>\n"
+                counter += 1
+
+        return image_tokens, counter, start_counter
+
+    def _compose_rag_message(self, rag_message: list[str], rag_image_tokens: list[str]) -> str:
+        """Compose the RAG message by replacing <images> placeholders with actual image tokens.
+
+        Args:
+        ----
+            rag_message (list[str]): The RAG message with placeholders.
+            rag_image_tokens (list[str]): The image tokens to replace the placeholders.
+
+        """
+        composed_message = []
+
+        image_idx = 0
+        for x in rag_message:
+            if x != "<images>":
+                composed_message.append(x)
+            else:
+                if image_idx < len(rag_image_tokens):
+                    composed_message.append(rag_image_tokens[image_idx])
+                    image_idx += 1
+                else:
+                    log.warning(
+                        "Not enough images to replace <images> placeholder in RAG message."
+                    )
+
+        return "\n".join(composed_message)
 
     def generate_until(self, requests: list[TaskInstance]) -> list[str]:
         """Generate greedily until a stopping sequence.
@@ -226,13 +308,15 @@ class Phi3v(Model):
             tokens = self.tokenizer.encode(x[0])
             return -len(tokens), x[0]
 
+        configurable_task: ConfigurableTask = requests[0].args[2].__self__
+
         # Group requests by their generation_kwargs, so that we don't try to execute, e.g., greedy
         # sampling and temp=0.8 sampling in the same batch.
         reordered = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
         chunks = reordered.get_batched(n=self.batch_size, batch_fn=None)
 
-        num_iters = (len(requests) + self.batch_size - 1) // self.batch_size
-        pbar_kwargs = dict(total=num_iters, disable=self.rank != 0, desc="Model Responding")
+        # num_iters = (len(requests) + self.batch_size - 1) // self.batch_size
+        pbar_kwargs = dict(total=len(requests), disable=self.rank != 0, desc="Model Responding")
         pbar = utils.get_progress_bar(**pbar_kwargs)
         for chunk in chunks:
             (
@@ -275,6 +359,9 @@ class Phi3v(Model):
             rag_enabled = self._is_rag_enabled(gen_kwargs)
             if rag_enabled:
                 rag = (gen_kwargs or {}).get("rag") or {}
+                rag["doc_to_target"] = configurable_task.doc_to_target
+                rag["doc_to_visual"] = configurable_task.doc_to_visual
+                rag["test_docs"] = configurable_task.test_docs
                 rag_position = rag.get("position", "pre-sample")
                 self._setup_rag(gen_kwargs)
 
@@ -298,16 +385,18 @@ class Phi3v(Model):
                     rag_messages[k] = v
 
             image_counter = 0
+            _batched_visuals = []
             for i in range(len(batched_contexts)):
+                _batched_visual_to_add = batched_visuals[i]
+
                 rag_message = None
                 if rag_enabled:
                     if i in rag_messages:
                         rag_message = rag_messages[i]
                     else:
                         rag_message = self._retrieve(gen_kwargs, visual)[0]
-                    # Extract the text from the retrieved data, which is structured as a
-                    # list of one element (a dict) in a standard OpenAI-like conversation format
-                    rag_message = rag_message[0]["text"]
+                    # Get the actual message and the images
+                    rag_message, rag_images = rag_message["rag_data"], rag_message["images"]
 
                 # Build the prompt with <image> tokens and RAG content, if any
                 if "<image>" in batched_contexts[i]:
@@ -317,59 +406,84 @@ class Phi3v(Model):
                         query = query.replace("<image>", f"<|image_{img_placeholder_count}|>", 1)
                         img_placeholder_count += 1
                 else:
-                    query = ""
-                    image_tokens = ""
-                    # Using `batched_visuals[i]` instead of `batched_visuals`
-                    # to support batching
-                    for _ in range(len(batched_visuals[i])):
-                        image_tokens += f"<|image_{image_counter+1}|>\n"
-                        image_counter += 1
+                    # No RAG: just use the vanilla model
+                    if not rag_enabled or rag_message is None:
+                        image_tokens, image_counter, _ = self._prepare_image_tokens(
+                            batched_visuals[i], image_counter
+                        )  # noqa: E501
+                        query = image_tokens + batched_contexts[i]
 
-                    # When RAG is enabled and there is retrieved content, we can erase the original
-                    # query, and reconstruct it later by putting the retrieved content in the
-                    # right place
-                    query = image_tokens + batched_contexts[i]
-                    if rag_enabled and rag_message is not None:
-                        query = ""
+                    # RAG is enabled and there is actual retrieved content
+                    elif rag_enabled and rag_message is not None:
+                        # Retrieved data goes at the beginning of the context
+                        if rag_position == "pre-sample":
+                            rag_image_tokens, image_counter, _ = self._prepare_image_tokens(
+                                rag_images, image_counter, return_as_list=True
+                            )  # noqa: E501
+                            image_tokens, image_counter, _ = self._prepare_image_tokens(
+                                batched_visuals[i], image_counter
+                            )  # noqa: E501
+                            rag_message = self._compose_rag_message(rag_message, rag_image_tokens)
 
-                    # Retrieved data goes at the beginning of the context
-                    if rag_enabled and rag_position == "pre-sample" and rag_message is not None:
-                        query = "".join(
-                            [
-                                rag_message,
-                                "\n\n",
-                                image_tokens,
-                                batched_contexts[i],
-                            ]
-                        )
+                            if len(rag_images) > 0:
+                                _batched_visual_to_add = rag_images + _batched_visual_to_add
 
-                    # Retrieved data goes after the image, before the query
-                    if rag_enabled and rag_position == "post-sample" and rag_message is not None:
-                        query = "".join(
-                            [
-                                image_tokens,
-                                "\n",
-                                rag_message,
-                                "\n\n",
-                                batched_contexts[i],
-                            ]
-                        )
+                            query = "".join(
+                                [
+                                    rag_message,
+                                    "\n\n",
+                                    image_tokens,
+                                    batched_contexts[i],
+                                ]
+                            )
 
-                    # Retrieved data goes at the end of the context
-                    if (
-                        rag_enabled
-                        and rag_position == "post-sample-and-query"
-                        and rag_message is not None
-                    ):
-                        query = "".join(
-                            [
-                                image_tokens,
-                                "\n",
-                                batched_contexts[i],
-                                "\n",
-                                rag_message,
-                            ]
-                        )
+                        # Retrieved data goes after the image, before the query
+                        if rag_position == "post-sample":
+                            image_tokens, image_counter, _ = self._prepare_image_tokens(
+                                batched_visuals[i], image_counter
+                            )  # noqa: E501
+                            rag_image_tokens, image_counter, _ = self._prepare_image_tokens(
+                                rag_images, image_counter
+                            )  # noqa: E501
+                            rag_message = self._compose_rag_message(rag_message, rag_image_tokens)
+
+                            if len(rag_images) > 0:
+                                _batched_visual_to_add = _batched_visual_to_add + rag_images
+
+                            query = "".join(
+                                [
+                                    image_tokens,
+                                    "\n",
+                                    rag_message,
+                                    "\n\n",
+                                    batched_contexts[i],
+                                ]
+                            )
+
+                        # Retrieved data goes at the end of the context
+                        if rag_position == "post-sample-and-query":
+                            image_tokens, image_counter, _ = self._prepare_image_tokens(
+                                batched_visuals[i], image_counter
+                            )  # noqa: E501
+                            rag_image_tokens, image_counter, _ = self._prepare_image_tokens(
+                                rag_images, image_counter
+                            )  # noqa: E501
+                            rag_message = self._compose_rag_message(rag_message, rag_image_tokens)
+
+                            if len(rag_images) > 0:
+                                _batched_visual_to_add = _batched_visual_to_add + rag_images
+
+                            query = "".join(
+                                [
+                                    image_tokens,
+                                    "\n",
+                                    batched_contexts[i],
+                                    "\n\n",
+                                    rag_message,
+                                ]
+                            )
+
+                _batched_visuals.append(_batched_visual_to_add)
 
                 messages = [{"role": "user", "content": query}]
                 batched_contexts[i] = self.tokenizer.apply_chat_template(
@@ -379,7 +493,8 @@ class Phi3v(Model):
             # Moved here so that the number of visuals corresponds to the number of contexts
             # and the code that inserts <image> tokens correctly sees the number of images
             # associated to each context
-            batched_visuals = _flatten_list(batched_visuals)
+            images_per_request = [len(x) for x in _batched_visuals]
+            batched_visuals = _flatten_list(_batched_visuals)
 
             context = batched_contexts
             input_ids = self.processor(
@@ -395,6 +510,12 @@ class Phi3v(Model):
                 gen_kwargs["top_p"] = None
             if "num_beams" not in gen_kwargs:
                 gen_kwargs["num_beams"] = 1
+
+            # Remove functions from gen_kwargs["rag"] so that pickle doesn't complain
+            if rag_enabled:
+                rag.pop("doc_to_target")
+                rag.pop("doc_to_visual")
+                rag.pop("test_docs")
 
             # Generate answer
             pad_token_id = (
@@ -418,9 +539,16 @@ class Phi3v(Model):
             response = self.processor.batch_decode(
                 generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
-            res.extend(response)
-            self.cache_hook.add_partial("generate_until", (context, gen_kwargs), response)
-            pbar.update(1)
+            for idx, (ans, context) in enumerate(zip(response, batched_contexts, strict=True)):
+                _ans = TaskSingleOutput(
+                    answer=ans,
+                    context=context,
+                    context_tokens_count=input_ids["attention_mask"][idx].sum(),
+                    num_images=images_per_request[idx],
+                )
+                res.append(_ans)
+                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
+                pbar.update(1)
 
         # Reorder the group of results back to original unsorted form
         res = reordered.get_original(res)

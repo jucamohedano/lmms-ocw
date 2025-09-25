@@ -10,6 +10,10 @@ output_type: generate_until
 test_split: test
 
 metric_list:
+  - metric: context_length
+    aggregation: mean
+    higher_is_better: true
+    raw_results: true
   - metric: concept_semantic_similarity
     aggregation: concept_semantic_similarity
     higher_is_better: true

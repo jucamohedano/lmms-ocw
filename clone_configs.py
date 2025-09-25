@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any
+import copy
 
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
@@ -22,6 +23,14 @@ def _get_args() -> argparse.Namespace:
         required=True,
         type=str,
         help="New configuration file to create",
+    )
+
+    parser.add_argument(
+        "--new-task-name",
+        required=False,
+        type=str,
+        default=None,
+        help="New task name",
     )
 
     parser.add_argument(
@@ -109,7 +118,10 @@ def main(args: argparse.Namespace) -> None:
             continue
 
         # Construct the path to the new task
-        new_task = task_parent / (args.base_config + args.new_config + ".yaml")
+        if args.new_config.startswith(">"):
+            new_task = task_parent / (args.new_config[1:] + ".yaml")
+        else:
+            new_task = task_parent / (args.base_config + args.new_config + ".yaml")
 
         # If the new task already exists and we don't want to update existing tasks, skip it
         if new_task.exists() and not args.update_existing:
@@ -121,11 +133,27 @@ def main(args: argparse.Namespace) -> None:
             base_task_dict = yaml.load(f)
 
         # Edit base task with `edit` info
-        _deep_update(base_task_dict, edit)
-        base_task_dict["task"] = base_task_dict["task"] + args.new_config
+        edit_custom = copy.deepcopy(edit)
+        # Find any strings that is "$TASK_NAME" and replace it with `task_parent.name`
+        def replace_task_name(d):
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    replace_task_name(v)
+                elif isinstance(v, str) and "$TASK_NAME" in v:
+                    d[k] = v.replace("$TASK_NAME", task_parent.name)
+        replace_task_name(edit_custom)
+
+        _deep_update(base_task_dict, edit_custom)
+        if args.new_task_name is not None:
+            base_task_dict["task"] = task_parent.name + "_" + args.new_task_name
+        else:
+            base_task_dict["task"] = base_task_dict["task"] + args.new_config
 
         if args.dry_run:
-            print(f"\t> Would create/update {new_task}")
+            if new_task.exists():
+                print(f"\t> Would update {new_task}")
+            else:
+                print(f"\t> Would create {new_task}")
             continue
 
         # Save the new file while keeping the same order and spacing as the original file

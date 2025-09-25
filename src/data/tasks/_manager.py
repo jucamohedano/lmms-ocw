@@ -937,8 +937,10 @@ class ConfigurableTask(Task):
         """
         if self.OUTPUT_TYPE == "generate_until":
             if isinstance(results, list) and isinstance(results[0], list):
+                raw_results = [res for res in results[0]]
                 results = [res.strip() for res in results[0]]
             else:
+                raw_results = [res for res in results]
                 results = [res.strip() for res in results]
 
         kwargs = {}
@@ -1079,7 +1081,11 @@ class ConfigurableTask(Task):
                     try:
                         result_score = self._metric_fn_list[metric](
                             references=gold,
-                            predictions=result,
+                            predictions=(
+                                result
+                                if "raw_results" not in self._metric_fn_kwargs[metric]
+                                else raw_results
+                            ),
                             **self._metric_fn_kwargs[metric],
                         )
                     except TypeError:  # Needed for now to use our metrics and HF Evaluate metrics

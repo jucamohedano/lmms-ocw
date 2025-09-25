@@ -1,0 +1,23 @@
+task: "eurosat_rag_from_caltech101_4_shot_type_2"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "Answer:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "caltech101/train/openai-clip-vit-base-patch32"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "Format the output as in these unrelated examples:\n<images>Answer: {}"
+
+    database_format: "pt"
+    search_modality: "in-domain-rag"
+    grab_data_type: "image"
+    format: "interleaved"
+    num_samples: 4
+include: assets/_default_template_yaml
