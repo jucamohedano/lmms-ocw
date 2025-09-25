@@ -8,11 +8,13 @@ from src.data.tasks._api import (
 )
 from src.data.tasks._base import Task, TaskInstance, TaskOutput
 from src.data.tasks._manager import TaskManager
+from src.data.tasks._output import TaskSingleOutput
 
 __all__ = [
     "Task",
     "TaskOutput",
     "TaskInstance",
+    "TaskSingleOutput",
     "TaskManager",
     "get_consolidated_group_results",
     "get_consolidated_results",

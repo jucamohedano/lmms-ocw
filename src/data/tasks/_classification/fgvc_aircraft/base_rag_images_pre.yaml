@@ -13,7 +13,7 @@ generation_kwargs:
     enabled: True
     database_path: "cc12m/openai_ViT-B-32/index"
     model_name: "openai/clip-vit-base-patch32"
-    prompt: "You are an intelligent assistant capable of generating accurate and detailed captions for images. You will be given some retrieved images and their keywords. The last image is the input image, others are retrieved examples to help you. Response the caption for the image directly, do not include any explanations or unrelated details.<images>Image: The following image.\nRetrieved_Image_Caption: {}"
+    prompt: "You are an intelligent assistant capable of generating accurate and detailed captions for images. You will be given some retrieved images and their keywords. The last image is the input image, others are retrieved examples to help you. Response the caption for the image directly, do not include any explanations or unrelated details.<images>Image: The following image.\nRetrieved_Image_Caption:\n{}"
 
     search_modality: "image"
     grab_data_type: "image"

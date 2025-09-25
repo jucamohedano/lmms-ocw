@@ -39,6 +39,7 @@ main() {
         "/wandb/"
         "*.db"
         "/notebooks/"
+        "/plots/"
     )
 
     # Read remotes from configuration file

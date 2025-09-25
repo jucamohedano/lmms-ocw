@@ -2,7 +2,7 @@ import base64
 import os
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from PIL import Image
@@ -10,7 +10,8 @@ from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
 
 from src import utils
-from src.data.tasks import TaskInstance
+from src.data.tasks import TaskInstance, TaskSingleOutput
+from src.data.tasks._manager import ConfigurableTask
 from src.models._api import register_model
 from src.models._base import Model
 from src.retrieval import Retriever
@@ -176,6 +177,7 @@ class Qwen2VL(Model):
         rag = (gen_kwargs or {}).get("rag") or {}
         self._retriever = Retriever(
             Path(db_root) / rag.get("database_path"),
+            format=rag.get("database_format", "faiss"),
             model_name=rag.get("model_name"),
         )
         log.info("Retrieval database loaded!")
@@ -197,16 +199,22 @@ class Qwen2VL(Model):
             log.error("RAG is enabled but retriever is not set up.")
             exit()
 
-        def prepare(image: Image.Image) -> str:
+        def prepare(image: Image.Image) -> dict[str, Any]:
             base64_image = image.convert("RGB")
             buffer = BytesIO()
             base64_image.save(buffer, format="JPEG")
             base64_bytes = base64.b64encode(buffer.getvalue())
             base64_string = base64_bytes.decode("utf-8")
 
-            return base64_string
+            payload = {"type": "image", "image": f"data:image/jpeg;base64,{base64_string}"}
 
-        return self._retriever.retrieve_and_prepare(gen_kwargs, images, prepare=prepare)
+            return payload
+
+        result = self._retriever.retrieve_and_prepare(gen_kwargs, images, prepare=prepare)
+        assert isinstance(result, list), f"Expected list, got {type(result)}"
+        result = cast(list[list[dict[str, Any]]], result)
+
+        return result
 
     def generate_until(self, requests: list[TaskInstance]) -> list[str]:
         """Generate greedily until a stopping sequence.
@@ -244,6 +252,8 @@ class Qwen2VL(Model):
             tokens = self.tokenizer.encode(x[0])
             return -len(tokens), x[0]
 
+        configurable_task: ConfigurableTask = requests[0].args[2].__self__
+
         # Group requests by their generation_kwargs, so that we don't try to execute, e.g., greedy
         # sampling and temp=0.8 sampling in the same batch.
         reordered = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
@@ -276,6 +286,9 @@ class Qwen2VL(Model):
             rag_enabled = self._is_rag_enabled(gen_kwargs)
             if rag_enabled:
                 rag = (gen_kwargs or {}).get("rag") or {}
+                rag["doc_to_target"] = configurable_task.doc_to_target
+                rag["doc_to_visual"] = configurable_task.doc_to_visual
+                rag["test_docs"] = configurable_task.test_docs
                 rag_position = rag.get("position", "pre-sample")
                 self._setup_rag(gen_kwargs)
 
@@ -316,6 +329,7 @@ class Qwen2VL(Model):
                     rag_messages[k] = v
 
             messages = []
+            images_per_request = []
             for i, context in enumerate(batched_contexts):
                 if "<image>" in context:
                     context = context.replace("<image>", "")
@@ -324,6 +338,7 @@ class Qwen2VL(Model):
 
                 if len(batched_visuals) > 0:
                     visual = batched_visuals[i] if i < len(batched_visuals) else None
+                    _images_counter = len(visual) if isinstance(visual, list | tuple) else 1
                     if isinstance(visual, Image.Image):  # Single image
                         base64_image = visual.convert("RGB")
                         buffer = BytesIO()
@@ -337,6 +352,14 @@ class Qwen2VL(Model):
                                 rag_message = rag_messages[i]
                             else:
                                 rag_message = self._retrieve(gen_kwargs, base64_image)[0]
+
+                            # Update the image counter, used for stats
+                            _images_counter += sum(
+                                1
+                                for _msg in rag_message
+                                for k, v in _msg.items()
+                                if k == "type" and v == "image"
+                            )
 
                         # Construct the message
                         content = []
@@ -383,6 +406,7 @@ class Qwen2VL(Model):
                                 "content": content,
                             }
                         )
+                        images_per_request.append(_images_counter)
 
                     elif isinstance(visual, list | tuple) and all(
                         isinstance(v, Image.Image) for v in visual
@@ -446,6 +470,12 @@ class Qwen2VL(Model):
             if "num_beams" not in gen_kwargs:
                 gen_kwargs["num_beams"] = 1
 
+            # Remove functions from gen_kwargs["rag"] so that pickle doesn't complain
+            if rag_enabled:
+                rag.pop("doc_to_target")
+                rag.pop("doc_to_visual")
+                rag.pop("test_docs")
+
             pad_token_id = self.tokenizer.pad_token_id
 
             cont = self.model.generate(
@@ -467,9 +497,14 @@ class Qwen2VL(Model):
             answers = self.processor.batch_decode(
                 generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
-
-            for ans, context in zip(answers, batched_contexts, strict=True):
-                res.append(ans)
+            for idx, (ans, context) in enumerate(zip(answers, batched_contexts, strict=True)):
+                _ans = TaskSingleOutput(
+                    answer=ans,
+                    context=context,
+                    context_tokens_count=inputs["attention_mask"][idx].sum(),
+                    num_images=images_per_request[idx] if len(images_per_request) > idx else None,
+                )
+                res.append(_ans)
                 self.cache_hook.add_partial("generate_until", (context, gen_kwargs), ans)
                 pbar.update(1)
 

@@ -48,6 +48,7 @@ def load_results(experiment_name: str, model: str):
         "concept_semantic_similarity": [],
         "exact_match": [],
         "llama_inclusion": [],
+        "average_context_tokens": [],
         "file": [],
     }
 
@@ -100,6 +101,9 @@ def load_results(experiment_name: str, model: str):
             experiment["results"][experiment_name]["textual_inclusion,none"]
         )
         data["llama_inclusion"].append(llama_inclusion_score)
+        data["average_context_tokens"].append(
+            experiment["results"][experiment_name].get("context_length,none", 0)
+        )
         data["file"].append(file_name)
 
     data = pd.DataFrame(data)

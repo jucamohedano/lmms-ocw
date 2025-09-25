@@ -537,3 +537,38 @@ def word_perplexity(items: list) -> list:
 
     """
     return items
+
+
+@register_metric(
+    group_fn_name="mean",
+    higher_is_better=True,
+    output_types=["generate_until"],
+)
+def context_length(
+    predictions: list,
+    references: list,
+    **kwargs,
+) -> dict:
+    """Calculate the average context length on a list of documents.
+
+    Args:
+    ----
+        predictions (list): List of predictions.
+        references (list): List of references.
+        **kwargs: Additional keyword arguments (not used).
+
+    """
+    ctx_lengths = np.array(
+        [
+            pred.context_tokens_count
+            for pred in predictions
+            if pred.context_tokens_count is not None
+        ]
+    )
+
+    if len(ctx_lengths) == 0:
+        return {"context_length": 0.0}
+
+    # np.mean should be enough since None objects are filtered out when constructing
+    # ctx_lengths, but keeping np.nanmean for safety
+    return {"context_length": np.nanmean(ctx_lengths)}
