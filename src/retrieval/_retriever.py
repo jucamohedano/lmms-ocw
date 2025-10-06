@@ -411,6 +411,11 @@ class Retriever:
             format = rag.get("format", "list-captions")
             prompt = rag.get("prompt", "{}")
             caption_key = rag.get("caption_key", "caption")
+            limit = rag.get("limit", None)
+
+            for i in range(len(results_set)):
+                if limit is not None:
+                    results_set[i] = results_set[i][:limit]
 
             if format == "list-captions":
                 rag_data_set = []
