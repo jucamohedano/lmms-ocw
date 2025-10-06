@@ -4,6 +4,27 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
+# from transformers.pytorch_utils import (  # noqa: F401
+#     Conv1D,
+#     apply_chunking_to_forward,
+#     find_pruneable_heads_and_indices,
+#     id_tensor_storage,
+#     is_torch_greater_or_equal_than_1_13,
+#     prune_conv1d_layer,
+#     prune_layer,
+#     prune_linear_layer,
+# )
+# # Set these imported functions as members of transformers.modeling_utils
+# # so that LLaVa can use them
+# import transformers.modeling_utils as modeling_utils
+# modeling_utils.Conv1D = Conv1D
+# modeling_utils.apply_chunking_to_forward = apply_chunking_to_forward
+# modeling_utils.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+# modeling_utils.id_tensor_storage = id_tensor_storage
+# modeling_utils.is_torch_greater_or_equal_than_1_13 = is_torch_greater_or_equal_than_1_13
+# modeling_utils.prune_conv1d_layer = prune_conv1d_layer
+# modeling_utils.prune_layer = prune_layer
+# modeling_utils.prune_linear_layer = prune_linear_layer
 import torch
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from llava.conversation import conv_templates

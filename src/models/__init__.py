@@ -17,6 +17,7 @@ from src.models._llava_hf import LLaVA
 from src.models._llava_onevision import LLaVAOnevision
 from src.models._phi3v import Phi3v
 from src.models._qwen2_vl import Qwen2VL
+from src.models._rag_majority_voting import RAGMajorityVoting
 
 __all__ = [
     "MODELS",
@@ -45,6 +46,7 @@ MODEL_TYPES: dict[str, Callable] = {
     "phi3v": Phi3v,
     "qwen2-vl": Qwen2VL,
     "embedder-clip": EmbedderCLIP,
+    "rag-majority-voting": RAGMajorityVoting,
 }
 
 

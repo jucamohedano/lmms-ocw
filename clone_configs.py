@@ -22,7 +22,7 @@ def _get_args() -> argparse.Namespace:
         "--new-config",
         required=True,
         type=str,
-        help="New configuration file to create",
+        help="New configuration file to create. If it starts with '>', it will replace the base config name entirely.",
     )
 
     parser.add_argument(

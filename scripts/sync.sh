@@ -29,6 +29,7 @@ main() {
         ".env"
         ".cache"
         ".venv"
+        ".venv-grpo"
         ".pytest_cache"
         ".vscode"
         "__pycache__"
