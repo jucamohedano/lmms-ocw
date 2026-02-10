@@ -27,11 +27,12 @@ __all__ = [
     "semantic_similarity",
     "ter",
     "textual_inclusion",
+    "textual_iou",
     "textual_inclusion_llama32",
     "word_perplexity",
 ]
 
-INSTANCE_METRICS = ["acc_all", "ansl", "exact_match", "textual_inclusion"]
+INSTANCE_METRICS = ["acc_all", "ansl", "exact_match", "textual_inclusion", "textual_iou"]
 
 
 @register_metric(
@@ -312,6 +313,57 @@ def concept_semantic_similarity(items: list) -> list:
     return items
 
 
+@register_metric(
+    group_fn_name="concept_semantic_similarity@median",
+    higher_is_better=True,
+    output_types=["generate_until"],
+    can_bootstrap=False,
+)
+def median_concept_semantic_similarity(items: list) -> list:
+    """Median Concept Semantic Similarity.
+
+    Args:
+    ----
+        items (list): List of documents.
+
+    """
+    return items
+
+
+@register_metric(
+    group_fn_name="concept_semantic_similarity@min",
+    higher_is_better=True,
+    output_types=["generate_until"],
+    can_bootstrap=False,
+)
+def min_concept_semantic_similarity(items: list) -> list:
+    """Min Concept Semantic Similarity.
+
+    Args:
+    ----
+        items (list): List of documents.
+
+    """
+    return items
+
+
+@register_metric(
+    group_fn_name="simplified_concept_semantic_similarity",
+    higher_is_better=True,
+    output_types=["generate_until"],
+    can_bootstrap=False,
+)
+def simplified_concept_semantic_similarity(items: list) -> list:
+    """Simplified Concept Semantic Similarity.
+
+    Args:
+    ----
+        items (list): List of documents.
+
+    """
+    return items
+
+
 @register_metric(group_fn_name="mean", higher_is_better=True, output_types=["generate_until"])
 def exact_match(
     predictions: list,
@@ -480,6 +532,68 @@ def textual_inclusion(predictions: list, references: list) -> dict:
     return {"textual_inclusion": np.mean(score_list)}
 
 
+@register_metric(group_fn_name="mean", higher_is_better=True, output_types=["generate_until"])
+def textual_iou(predictions: list, references: list) -> dict:
+    """Calculate the intersection over union (IoU) for the predicted and reference texts.
+
+    Args:
+    ----
+        predictions (list): List of predictions.
+        references (list): List of references.
+
+    """
+
+    def postprocess(x: str) -> str:
+        x = (
+            x.strip()
+            .replace("\n", "")
+            .replace('"', "")
+            .replace("'", "")
+            .replace(",", "")
+            .strip()
+            .lower()
+        )
+        x = re.sub(
+            r"History:.*|Refine:.*|[^a-zA-Z,\s]", "", x
+        )  # Remove "History:", "Refine:", quotes, etc.
+
+        return x
+
+    def _iou(ref: str, pred: str) -> float:
+        ref_set = set(ref.split(" "))
+        pred_set = set([postprocess(x) for x in pred.split(" ")])
+
+        intersection = ref_set.intersection(pred_set)
+        union = ref_set.union(pred_set)
+
+        if len(union) == 0:
+            return 0.0
+
+        return len(intersection) / len(union)
+
+    score_list = [_iou(ref, pred) for ref, pred in zip(references, predictions, strict=True)]
+
+    return {"textual_iou": np.mean(score_list)}
+
+
+@register_metric(group_fn_name="mean", higher_is_better=True, output_types=["generate_until"])
+def accuracy(predictions: list, references: list) -> dict:
+    """Calculate the accuracy for the predicted and reference texts.
+
+    Args:
+    ----
+        predictions (list): List of predictions.
+        references (list): List of references.
+
+    """
+    score_list = [
+        ref.lower().strip() == pred.lower().strip()
+        for ref, pred in zip(references, predictions, strict=True)
+    ]
+
+    return {"accuracy": np.mean(score_list)}
+
+
 @register_metric(
     group_fn_name="textual_inclusion_llama32",
     higher_is_better=True,
@@ -572,3 +686,69 @@ def context_length(
     # np.mean should be enough since None objects are filtered out when constructing
     # ctx_lengths, but keeping np.nanmean for safety
     return {"context_length": np.nanmean(ctx_lengths)}
+
+
+@register_metric(
+    group_fn_name="mean",
+    higher_is_better=True,
+    output_types=["generate_until"],
+)
+def loglikelihood(
+    predictions: list,
+    references: list,
+    **kwargs,
+) -> dict:
+    """Calculate the average loglikelihood of the generated answers.
+
+    Args:
+    ----
+        predictions (list): List of predictions.
+        references (list): List of references.
+        **kwargs: Additional keyword arguments (not used).
+
+    """
+    loglikelihoods = np.array(
+        [pred.loglikelihood for pred in predictions if pred.loglikelihood is not None]
+    )
+
+    if len(loglikelihoods) == 0:
+        return {"loglikelihood": 0.0}
+
+    # np.mean should be enough since None objects are filtered out when constructing
+    # ctx_lengths, but keeping np.nanmean for safety
+    return {"loglikelihood": np.nanmean(loglikelihoods)}
+
+
+@register_metric(
+    group_fn_name="mean",
+    higher_is_better=True,
+    output_types=["generate_until"],
+)
+def avg_perplexity(
+    predictions: list,
+    references: list,
+    **kwargs,
+) -> dict:
+    """Calculate the average perplexity of the generated answers.
+
+    Args:
+    ----
+        predictions (list): List of predictions.
+        references (list): List of references.
+        **kwargs: Additional keyword arguments (not used).
+
+    """
+    perplexities = np.array(
+        [
+            pred.perplexity
+            for pred in predictions
+            if pred.perplexity is not None and pred.perplexity != float("inf")
+        ]
+    )
+
+    if len(perplexities) == 0:
+        return {"perplexity": 0.0}
+
+    # np.mean should be enough since None objects are filtered out when constructing
+    # ctx_lengths, but keeping np.nanmean for safety
+    return {"perplexity": np.nanmean(perplexities)}

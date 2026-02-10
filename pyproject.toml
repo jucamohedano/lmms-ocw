@@ -45,7 +45,7 @@ dependencies = [
   "torch>=2,<3",
   "torchvision>=0,<1",
   "wandb>=0,<1",
-  "xformers>=0.0.29.post1",
+  "xformers>=0.0.30",
   "faiss-cpu>=1.12.0",
 ]
 
@@ -97,7 +97,7 @@ ignore-init-method = true
 ignore-magic = true
 ignore-module = true
 ignore-nested-functions = true
-exclude = ["src/models/_phi3v_*.py"]
+exclude = ["src/models/_phi3v_*.py", "src/models/_phi4_modeling.py", "src/models/vision_siglip_navit.py", "src/models/speech_conformer_encoder.py", "src/models/processing_phi4mm.py", "src/models/configuration_phi4mm.py"]
 
 [tool.pytest.ini_options]
 cache_dir = "~/.cache/pytest"
@@ -148,9 +148,27 @@ unfixable = []
 "*.ipynb" = ["E501", "I", "ANN", "S", "G004", "T20"]
 "eval_*.py" = ["T201"]
 "src/models/_phi3v_*.py" = ["ALL"]
+"src/models/vision_siglip_navit.py" = ["ALL"]
+"src/models/speech_conformer_encoder.py" = ["ALL"]
+"src/models/processing_phi4mm.py" = ["ALL"]
+"src/models/configuration_phi4mm.py" = ["ALL"]
+"src/models/_phi4_modeling.py" = ["ALL"]
 
 [tools.setuptools.dynamic]
 version = {attr = "src.__version__"}
 
 [tool.bandit]
-exclude_dirs = ["src/models/_phi3v_*.py"]
+exclude_dirs = [
+    "src/models/_phi3v_*.py",
+    "src/models/processing_phi4mm.py",
+    "src/models/_phi4_modeling.py",
+]
+
+[tool.codespell]
+ignore-words-list = "thw"
+skip = "data/**,logs/**,*.bib,*.csv,*.js,src/data/tasks/**,src/models/vision_siglip_navit.py,src/models/processing_phi4mm.py,src/models/speech_conformer_encoder.py,src/models/_phi4_modeling.py"
+
+[tool.uv]
+override-dependencies = [
+    "xformers>=0.0.30",
+]

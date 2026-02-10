@@ -1,0 +1,32 @@
+task: "dtd_rag_in_domain_16_shot_final_with_labels"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    # prompt: "Answer:"
+    # prompt: "Follow these steps to find the answer:\n1.  **Hypothesize:** Based on the TARGET image's similarity to the reference examples, what is the most likely label?\n2.  **Verify:** Find that hypothesized label in the full class list.\n3.  **Final Answer:** Output the verified label from the list.\n\nHypothesis:\nVerification:\nAnswer:"
+    prompt: "Follow these steps to find the answer. Your response **must** follow this exact multi-line structure.\n\n---\n**Example of the required response format:**\nHypothesis: The target image looks most like the reference examples for '[example class]'.\nVerification: The label '[example class]' is present in the class list.\nAnswer: [example class]\n---\n\n**Now, provide your analysis for the TARGET image:**\nHypothesis:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "dtd/train/openai-clip-vit-base-patch32"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "Here are some examples of input-output pairs:\n<images>Answer: {}"
+
+    database_format: "pt"
+    search_modality: "in-domain-rag"
+    grab_data_type: "image"
+    format: "interleaved"
+    num_samples: 16
+    resize_images: 224
+    num_shots_per_class: 16
+
+    include_target_classes: "pre-query"
+    target_classes_format: "bullet-list"
+    target_classes_prompt: "The correct label must be **one** of the following:\n{}"
+
+include: assets/_default_template_yaml

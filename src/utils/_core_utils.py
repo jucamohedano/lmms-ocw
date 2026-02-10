@@ -244,6 +244,10 @@ def sanitize_list(li: list) -> list:
     elif isinstance(li, tuple):
         return tuple(sanitize_list(item) for item in li)
 
+    # Check if it is a `TaskSingleOutput`
+    if hasattr(li, "answer") and isinstance(li.answer, list | tuple):
+        return sanitize_list(li.answer)
+
     return str(li)
 
 

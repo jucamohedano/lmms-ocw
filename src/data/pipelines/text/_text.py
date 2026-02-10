@@ -233,8 +233,11 @@ def _score_pair_llama32(batch: dict, rank: int | None = None, **kwargs) -> dict:
             model=model_id,
             torch_dtype=torch.bfloat16,
             device_map="auto",
+            model_kwargs={"attn_implementation": "flash_attention_2"},
         )
         llama_32_model.generation_config.pad_token_id = llama_32_model.model.config.eos_token_id[0]
+        llama_32_model.tokenizer.pad_token_id = llama_32_model.model.config.eos_token_id[0]
+        llama_32_model.tokenizer.padding_side = "left"
 
     if reference_column not in batch:
         raise ValueError(f"{reference_column} missing in dataset")
@@ -257,6 +260,7 @@ def _score_pair_llama32(batch: dict, rank: int | None = None, **kwargs) -> dict:
             do_sample=False,
             top_p=None,
             temperature=None,
+            batch_size=1024,
         )
         outputs = [output[0]["generated_text"][-1]["content"] for output in outputs]
 

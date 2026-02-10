@@ -1,0 +1,36 @@
+task: "caltech101_streaming_similarity"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    # prompt: "Answer:"
+    prompt: "Follow these steps to find the answer. Your response **must** follow this exact multi-line structure.\n\n---\n**Example of the required response format:**\nHypothesis: The target image looks most like the reference examples for '[example class]'.\nVerification: This is not '[example class]', it is '[example class 2]'.\nAnswer: [example class 2]\n---\n\n**Now, provide your analysis for the TARGET image:**\nHypothesis:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  resize_input_image: 224
+  rag:
+    enabled: True
+    database_path: ""
+    model_name: "openai/clip-vit-base-patch32"
+    database_format: "dynamic_pt"
+    search_modality: "in-domain-rag"
+    grab_data_type: "image"
+    format: "interleaved"
+    num_samples: 16
+    resize_images: 224
+    store_memory: True
+
+    pre_image_prompt: "===== EXAMPLES END =====\nTARGET:"
+    prompt: "Here are some examples of input-output pairs:\n<images>Answer: {}"
+
+    majority_voting: True
+
+    include_target_classes: "pre-query"
+    target_classes_format: "bullet-list"
+    target_classes_prompt: "Classify the TARGET image. Choose exactly one label from the list:\n{}"
+    # target_classes_prompt: "The correct label must be **one** of the following:\n{}"
+
+include: assets/_default_template_yaml

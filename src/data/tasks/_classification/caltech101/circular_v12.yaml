@@ -1,0 +1,71 @@
+task: "caltech101_circular_v12"
+
+doc_to_text: !function assets/_caltech101_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - "You are an expert at broad semantic categorization of images, focusing on the main subject (e.g., animal, vehicle, plant, scene, texture). Use only general terms\u20141-2 words, no specifics.\nOutput only: \"Category: [1-2 words]\". Examples:\n\nPet: \"animal\"\nAuto: \"vehicle\"\nBloom: \"plant\"\nView: \"scene\"\nPattern: \"texture\"\nJet: \"vehicle\"\nClock: \"accessory\"\nCask: \"container\"\n\nCategory for this image:"
+      - "Refine: add categorical subtype.\nLabel:"
+      - "Classify TARGET with semantic-matching hierarchy.\nLabel:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  resize_input_image: 224
+  rag:
+    0:
+      enabled: True
+      database_path: "caltech101/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      prompt: "<images>"
+      database_format: "pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 16
+      separate_queries: True
+      cache_and_reuse: True
+
+      gen_batch_size: 4
+    1:
+      enabled: True
+      pipe_from: -1
+      separate_queries: True
+      format: "all-image-answer-pairs"
+      #
+      system_prompt: "You are an expert in visual domain inference and label refinement. Infer domain from images (e.g., object classes, animal types). Refine target by adding categorical specificity each time, using common subtypes\u2014avoid attributes like color unless key.\nInternal Reasoning:\n- Infer domain.\n- Spot categorical differences (type, subclass).\n- Evolve history: Add subtype (e.g., \"animal\" \u2192 \"mammal\"; \"mammal\" \u2192 \"elephant\"); no repeats, grounded in visuals.\n- 1-2 words; progress categorically.\n\nGuidelines:\n- Refine within domain, use standard terms.\n- Output only: \"Label: [1-2 words]\".\n\nExamples:\n- History: \"vehicle\"; \u2192 \"airplane\"\n- History: \"vehicle, airplane\"; \u2192 \"jetliner\"\n- History: \"animal\"; \u2192 \"bird\"\n- History: \"animal, bird\"; \u2192 \"flamingo\""
+      context_prompt: "Context (same domain):\n"
+      prompt: "Labels: {}\n"
+      end_context_prompt: "===== END =====\nTARGET:"
+      prompt_for_sample: "Labels: {}\n"
+      #
+      keep_label_for_hot_image: True
+      keep_full_history: True
+      concatenate_labels: ", "
+      clean_output_labels: True
+      circular: True
+      max_iters: 3
+      cache_and_reuse: True
+      gen_batch_size: 4 # Process one item at a time when generating, to avoid OOM
+      resize_images: 224
+
+    2:
+      enabled: True
+      pipe_from: 1
+      #
+      system_prompt: "You are a visual classifier for hierarchies. Infer domain from examples. Classify target with comma-separated levels (2-4, broad to specific), using context terms for semantic fit.\nInternal Reasoning:\n- Infer domain/patterns.\n- Match visual features.\n- Build levels: Reuse context nouns/subtypes for precision; aim for GT-like terms.\n\nGuidelines:\n- Output only: \"Label: [hierarchy]\".\n- Common, direct words.\n\nExamples:\n- Context: \"vehicle, plane, jet\"; \"vehicle, bike, motorcycle\" \u2192 Label: vehicle, plane, airliner\n- Context: \"animal, mammal, elephant\"; \"animal, bird, flamingo\" \u2192 Label: animal, mammal, lion"
+      prompt: "Context:\n<images>Label: {}"
+      # prompt: "You are an open-world visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them to infer what kinds of distinctions matter in this domain (e.g., texture patterns, object subtypes, material differences, color or shape features).\n\nYour task is to classify a new image from the same domain.\nMatch the level of specificity shown in the context labels.\nAvoid generic words such as \"object\", \"thing\", \"vehicle\", \"animal\", \"texture\" unless they are the most specific category possible\n\nAnswer concisely with the list of coarse to fine-grained categories, following these examples:\n===== EXAMPLES START =====\n{}\n===== EXAMPLES END ====="
+      end_context_prompt: "===== END =====\nTARGET:"
+      keep_full_history: True
+      concatenate_labels: ", "
+      format: "interleaved"
+      resize_images: 224
+      clean_answer: True
+      include_image: True # Since step 0 and 1 do not put it into the context
+
+include: assets/_default_template_yaml

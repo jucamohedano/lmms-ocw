@@ -276,3 +276,19 @@ def clip_vit_b32_openai(**model_kwargs) -> Model:
     model_name_or_path = "openai/clip-vit-base-patch32"
     model = EmbedderCLIP(model_name_or_path, **model_kwargs)
     return model
+
+
+@register_model("clip-vit-b16-openai")
+def clip_vit_b16_openai(**model_kwargs) -> Model:
+    """Load the CLIP ViT B/16 model from OpenAI."""
+    model_name_or_path = "openai/clip-vit-base-patch16"
+    model = EmbedderCLIP(model_name_or_path, **model_kwargs)
+    return model
+
+
+@register_model("clip-vit-l14-openai")
+def clip_vit_l14_openai(**model_kwargs) -> Model:
+    """Load the CLIP ViT L/14 model from OpenAI."""
+    model_name_or_path = "openai/clip-vit-large-patch14"
+    model = EmbedderCLIP(model_name_or_path, **model_kwargs)
+    return model

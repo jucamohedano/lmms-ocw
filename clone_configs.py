@@ -97,12 +97,27 @@ def _yaml_setup() -> YAML:
     return yaml
 
 
+def _make_int_keys(diff: dict) -> dict:
+    """Convert string keys that are integers to actual integers."""
+    new_diff = {}
+    for k, v in diff.items():
+        if isinstance(v, dict):
+            v = _make_int_keys(v)
+        try:
+            int_k = int(k)
+            new_diff[int_k] = v
+        except ValueError:
+            new_diff[k] = v
+    return new_diff
+
+
 def main(args: argparse.Namespace) -> None:
     yaml = _yaml_setup()
 
     # Load the diff file
     with open(args.diff) as f:
         edit = json.load(f)
+    edit = _make_int_keys(edit)
 
     # Get the folder containing all the tasks
     tasks_parents = Path("src") / "data" / "tasks" / "_classification"

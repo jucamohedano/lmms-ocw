@@ -1,0 +1,29 @@
+task: "caltech101_random_in_domain_16_shot_final_v3"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "Answer:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "caltech101/train/openai-clip-vit-base-patch32"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "The following examples are for **reference only**. They show examples of some classes:\n<images>Answer: {}"
+    pre_image_prompt: "===== EXAMPLES END =====\nTARGET:"
+    database_format: "pt"
+    search_modality: "random"
+    grab_data_type: "image"
+    format: "interleaved"
+    num_samples: 16
+    resize_images: 224
+    num_shots_per_class: 16
+    include_target_classes: "pre-query"
+    target_classes_format: "bullet-list"
+    target_classes_prompt: "Categories (choose exactly one):\n{}"
+  resize_input_image: 224
+include: assets/_default_template_yaml

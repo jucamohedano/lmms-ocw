@@ -1,5 +1,10 @@
+# pytype: skip-file
+
+import base64
 import random
+from collections import Counter
 from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -7,10 +12,16 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms.v2 as T
 from PIL import Image
+from qwen_vl_utils import process_vision_info
 from transformers import AutoModel, AutoProcessor
 
 from src import utils
-from src.retrieval import RetrievalDatabase, RetrievalTensorDatabase, get_images_by_key
+from src.retrieval import (
+    DynamicRetrievalTensorDatabase,
+    RetrievalDatabase,
+    RetrievalTensorDatabase,
+    get_images_by_key,
+)
 
 __all__ = ["Retriever"]
 
@@ -25,22 +36,30 @@ class Retriever:
         path: str | Path,
         format: str = "faiss",
         model_name: str = "openai/clip-vit-base-patch32",
+        use_flash_attention_2: bool | None = utils.package_available("flash_attn"),
+        dtype: str | torch.dtype = "float16",
         device_map: str = "auto",
+        few_shot: int | None = None,
     ) -> None:
         """Retrieve similar images from a retrieval database.
 
         Args:
         ----
             path (str | Path): Path to the retrieval database.
-            format (str): Format of the retrieval database. Either 'faiss' or 'pt'.
+            format (str): Format of the retrieval database. Either 'faiss', 'pt' or 'dynamic_pt'.
             model_name (str): Name of the pre-trained model to use.
+            use_flash_attention_2 (bool | None): Whether to use flash attention 2 if available.
+            dtype (str | torch.dtype): Data type to use for the model.
             device_map (str): Device map to use for the model. Either 'auto' or
                 'cpu'. If 'auto', the model will be loaded on GPU if available.
+            few_shot (int | None): If specified, restrict the database to few-shot
+                examples per class. Works only for 'pt' format.
 
         """
         self._path = path
+        self._use_flash_attention_2 = use_flash_attention_2
 
-        assert format in ["faiss", "pt"], "format is not valid"
+        assert format in ["faiss", "pt", "dynamic_pt"], "format is not valid"
 
         self._device = "cuda" if torch.cuda.is_available() and device_map == "auto" else "cpu"
 
@@ -49,10 +68,59 @@ class Retriever:
             self._database = RetrievalDatabase(path)
         elif format == "pt":
             self._database = RetrievalTensorDatabase(path, device=self._device)
+            if few_shot is not None:
+                self._database.few_shot(few_shot)
+        elif format == "dynamic_pt":
+            self._database = DynamicRetrievalTensorDatabase(device=self._device)
+        else:
+            raise ValueError(f"Unsupported format: {format}")
 
-        self._model = AutoModel.from_pretrained(model_name, device_map=device_map)
+        if "gme" in model_name.lower():
+            model_kwargs = {
+                "torch_dtype": dtype,
+                "device_map": device_map,
+            }
+            if self._use_flash_attention_2:
+                model_kwargs["attn_implementation"] = "flash_attention_2"
+
+            self._model = AutoModel.from_pretrained(
+                model_name, trust_remote_code=True, **model_kwargs
+            )
+            self._processor = AutoProcessor.from_pretrained(model_name)
+            self._interface = "gme"
+
+        elif model_name in ["Qwen/Qwen2-VL-7B-Instruct"]:
+            model_kwargs = {
+                "torch_dtype": dtype,
+                "device_map": device_map,
+            }
+            if self._use_flash_attention_2:
+                model_kwargs["attn_implementation"] = "flash_attention_2"
+
+            processor_kwargs = {
+                "max_pixels": 1024 * 28 * 28,
+                "min_pixels": 4 * 28 * 28,
+            }
+
+            try:
+                from transformers import Qwen2VLForConditionalGeneration
+            except ImportError as e:
+                raise ValueError("Failed to import Qwen2VLForConditionalGeneration") from e
+
+            self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+                model_name, **model_kwargs
+            )
+            self._processor = AutoProcessor.from_pretrained(model_name, **processor_kwargs)
+            self._spatial_merge_factor = 2
+            self._pool_method = "mean"
+            self._interface = "qwen2vl"
+
+        else:
+            self._model = AutoModel.from_pretrained(model_name, device_map=device_map)
+            self._processor = AutoProcessor.from_pretrained(model_name)
+            self._interface = "clip"
+
         self._model.eval()
-        self._processor = AutoProcessor.from_pretrained(model_name)
 
         self._vocab_transform = lambda x: x
 
@@ -87,6 +155,175 @@ class Retriever:
             self._vocab_transform = utils.default_vocabulary_transforms()
 
     @torch.no_grad()
+    def store_memory(
+        self,
+        images: Image.Image | list[Image.Image],
+        labels: str | list[str],
+    ) -> None:
+        """Store the given image(s) in the retrieval database with the corresponding label(s).
+
+        Args:
+        ----
+            images (Image.Image | list[Image.Image]): The image(s) to store.
+            labels (str | list[str]): The label(s) corresponding to the image(s).
+
+        """
+        assert self._format in [
+            "dynamic_pt"
+        ], "`store_memory` is only supported for the `dynamic_pt` format."
+
+        if not isinstance(images, list):
+            images = [images]
+        if not isinstance(labels, list):
+            labels = [labels]
+
+        assert len(images) == len(labels), "Number of images and labels must be the same."
+
+        # Embed images so that they can be stored
+        embeddings = self._embed_image_queries(images)
+        embeddings = F.normalize(embeddings, p=2, dim=-1)
+
+        self._database.add_data(embeddings, list(zip(images, labels, strict=True)))
+
+    @torch.no_grad()
+    def _embed_image_queries(self, queries: list[Image.Image]) -> torch.Tensor:
+        """Embed image queries into the joint embedding space. Returns unnormalized embeddings.
+
+        Args:
+        ----
+            queries (list[Image.Image]): List of input images.
+
+        """
+        if self._interface == "gme":
+            return self._model.get_image_embeddings(images=queries)
+
+        elif self._interface == "qwen2vl":
+            messages = []
+            for visual in queries:
+                base64_image = visual.convert("RGB")
+                buffer = BytesIO()
+                base64_image.save(buffer, format="JPEG")
+                base64_bytes = base64.b64encode(buffer.getvalue())
+                base64_string = base64_bytes.decode("utf-8")
+
+                messages.append(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "image": f"data:image/jpeg;base64,{base64_string}",
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "Describe this image.",
+                                },
+                            ],
+                        }
+                    ]
+                )
+
+            # Prepare inputs
+            texts = [
+                self._processor.apply_chat_template(
+                    msg, tokenize=False, add_generation_prompt=True
+                )
+                for msg in messages
+            ]
+            image_inputs, video_inputs = process_vision_info(messages)
+
+            inputs = self._processor(
+                text=texts,
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+
+            inputs = inputs.to(self._device)
+
+            with torch.no_grad():
+                embeddings = self._model.visual(
+                    inputs["pixel_values"],
+                    grid_thw=inputs["image_grid_thw"],
+                )
+
+            pooled_embeddings = []
+            start_idx = 0
+            for thw in inputs["image_grid_thw"]:
+                t, h, w = thw.tolist()
+
+                compressed_h = (h + 1) // self._spatial_merge_factor
+                compressed_w = (w + 1) // self._spatial_merge_factor
+                num_tokens = t * compressed_h * compressed_w
+
+                # Extract this image's embeddings
+                image_emb = embeddings[start_idx : start_idx + num_tokens]
+
+                if self._pool_method == "mean":
+                    pooled = image_emb.mean(dim=0)
+                elif self._pool_method == "max":
+                    pooled = image_emb.max(dim=0)[0]
+                elif self._pool_method == "first":
+                    pooled = image_emb[0]
+                else:
+                    raise ValueError(f"Unknown pool_method: {self._pool_method}")
+
+                pooled_embeddings.append(pooled)
+                start_idx += num_tokens
+
+            embeddings = torch.stack(pooled_embeddings)  # [batch_size, hidden_dim]
+            return embeddings
+
+        if self._transform is not None:
+            queries = torch.stack(
+                [
+                    self._transform(
+                        T.functional.to_image(image).to(self._device, non_blocking=True)
+                    )
+                    for image in queries
+                ],
+                dim=0,
+            )
+            inputs = {
+                "pixel_values": queries,
+            }
+        else:
+            inputs = self._processor(images=queries, return_tensors="pt").to(self._device)
+
+        embeddings = self._model.get_image_features(**inputs)
+
+        return embeddings
+
+    def _get_target_classes(self, rag: dict) -> list[dict]:
+        """Get target classes from the RAG configuration.
+
+        Args:
+        ----
+            rag (dict): RAG configuration dictionary.
+
+        """
+        doc_to_target = rag.get("doc_to_target")
+        test_docs = rag.get("test_docs")
+        if doc_to_target is None or test_docs is None:
+            raise ValueError(
+                "When using 'in-domain' search modality, 'doc_to_target' and 'test_docs' must be provided in rag configuration."  # noqa: E501
+            )
+
+        targets = sorted(set(test_docs()["target"]))
+
+        results_set = [
+            {
+                "image_path": target,  # Dummy, not actually used
+                "caption": doc_to_target({"target": target}),
+            }
+            for target in targets
+        ]
+
+        return results_set
+
+    @torch.no_grad()
     def retrieve(
         self,
         queries: str | list[str] | Image.Image | list[Image.Image],
@@ -119,30 +356,16 @@ class Retriever:
             for i in range(len(queries)):
                 if isinstance(queries[i], str):
                     queries[i] = Image.open(queries[i]).convert("RGB")
-
-            if self._transform is not None:
-                queries = torch.stack(
-                    [
-                        self._transform(
-                            T.functional.to_image(image).to(self._device, non_blocking=True)
-                        )
-                        for image in queries
-                    ],
-                    dim=0,
-                )
-                inputs = {
-                    "pixel_values": queries,
-                }
-            else:
-                inputs = self._processor(images=queries, return_tensors="pt").to(self._device)
-
-            embeddings = self._model.get_image_features(**inputs)
+            embeddings = self._embed_image_queries(queries)
 
         elif input_type == "text":
-            inputs = self._processor(
-                text=queries, return_tensors="pt", padding=True, truncation=True
-            ).to(self._device)
-            embeddings = self._model.get_text_features(**inputs)
+            if self._interface == "gme":
+                embeddings = self._model.get_text_embeddings(texts=queries)
+            else:
+                inputs = self._processor(
+                    text=queries, return_tensors="pt", padding=True, truncation=True
+                ).to(self._device)
+                embeddings = self._model.get_text_features(**inputs)
 
         else:
             raise ValueError(f"Unsupported input_type: {input_type}")
@@ -173,10 +396,11 @@ class Retriever:
             format (str): Format of the RAG context.
 
         """
-        rag_data = [
-            {"type": "text", "text": prompts[0]},
-            *retrieved_images,
-        ]
+        rag_data = []
+        if len(prompts) > 0 and len(prompts[0]) > 0:
+            rag_data.append({"type": "text", "text": prompts[0]})
+
+        rag_data.extend(retrieved_images)
 
         if format != "no-text" and len(prompts[1]) > 0:
             rag_data.append({"type": "text", "text": prompts[1].format(rag_text)})
@@ -189,6 +413,7 @@ class Retriever:
         images: list[Image.Image],
         prepare: Callable | None = None,
         result_callback: Callable | None = None,
+        doc_ids: dict | list | None = None,
     ) -> list[list[dict[str, Any]]] | list[dict[str, Any]] | None:
         """Retrieve relevant data for each image and prepare it for generation.
 
@@ -198,6 +423,7 @@ class Retriever:
             images (list[Image.Image]): List of input images.
             prepare (Callable, optional): Function to prepare the retrieved images for generation.
             result_callback (Callable, optional): Function to process the final retrieved data.
+            doc_ids (dict | list | None, optional): Document IDs to retrieve. Defaults to None.
 
         """
         rag = (gen_kwargs or {}).get("rag") or {}
@@ -212,15 +438,63 @@ class Retriever:
 
         # Randomly sample contexts from the database
         if search_modality == "random":
-            indices = list(range(len(self._database._metadata_provider)))
+            if self._format == "faiss":
+                indices = list(range(len(self._database._metadata_provider)))
 
-            results_set = []
-            for _ in range(len(images)):
-                sampled_idxs = random.sample(indices, k=rag.get("num_samples", 10))
-                retrieved = self._database._metadata_provider[sampled_idxs]
-                results_set.append(retrieved)
+                results_set = []
+                for _ in range(len(images)):
+                    sampled_idxs = random.sample(indices, k=rag.get("num_samples", 10))
+                    retrieved = self._database._metadata_provider[sampled_idxs]
+                    results_set.append(retrieved)
 
-        # Retrieve in-domain images
+            elif self._format in ["pt", "dynamic_pt"]:
+                doc_to_target = rag.get("doc_to_target")
+                doc_to_visual = rag.get("doc_to_visual")
+
+                results_set = []
+                if hasattr(self._database._metadata_provider, "keys"):
+                    keys = list(self._database._metadata_provider.keys())
+                else:
+                    # Fallback, should never happen if the database is properly
+                    # implemented, but just in case
+                    keys = []
+
+                if len(keys) == 0:
+                    rag_data_set = [[] for _ in range(len(images))]
+                    if result_callback is not None:
+                        rag_data_set = [
+                            result_callback(rag_data, images=None) for rag_data in rag_data_set
+                        ]
+                    return rag_data_set
+
+                for _ in range(len(images)):
+                    sampled_keys = random.sample(keys, min(rag.get("num_samples", 10), len(keys)))
+                    retrieved = [self._database._metadata_provider[k] for k in sampled_keys]
+                    results_set.append(retrieved)
+
+                _in_domain_images = {}
+                counter = 0
+                for results in results_set:
+                    for result in results:
+                        if not isinstance(result, dict):
+                            raise ValueError(
+                                "Each retrieved result must be a dictionary containing "
+                                "at least the keys 'target' and 'visual'."
+                            )
+
+                        if self._format == "dynamic_pt":
+                            result["caption"] = result["target"]
+                            result["target"] += f"_{counter}"
+                            result["image_path"] = result["target"]
+                            _in_domain_images[result["target"]] = result["visual"]
+                        else:
+                            result["caption"] = doc_to_target(result)
+                            result["target"] += f"_{counter}"
+                            result["image_path"] = result["target"]
+                            _in_domain_images[result["target"]] = doc_to_visual(result)[0]
+                        counter += 1
+
+        # Retrieve in-domain images (random, from test set)
         elif search_modality == "in-domain":
             doc_to_target = rag.get("doc_to_target")
             doc_to_visual = rag.get("doc_to_visual")
@@ -256,38 +530,59 @@ class Retriever:
                     "When using 'in-domain-rag' search modality, 'doc_to_target' and 'doc_to_visual' must be provided in rag configuration."  # noqa: E501
                 )
 
+            # Ensure that it doesn't fail when the database is empty
+            if self._format == "dynamic_pt" and len(self._database._metadata_provider) == 0:
+                rag_data_set = [[] for _ in range(len(images))]
+                if result_callback is not None:
+                    rag_data_set = [
+                        result_callback(rag_data, images=None) for rag_data in rag_data_set
+                    ]
+                return rag_data_set
+
             results_set = self.retrieve(
                 images,
                 input_type="image",
                 num_samples=rag.get("num_samples", 10),
             )
 
+            if rag.get("majority_voting", False):
+                for result_idx in range(len(results_set)):
+                    labels = [x.get("target", "").strip() for x in results_set[result_idx]]
+
+                    # Keep only results in results_set[result_idx] that have the most common label
+                    if len(labels) == 0:
+                        continue
+
+                    # Use counter
+                    label_counts = Counter(labels)
+                    most_common_label, _ = label_counts.most_common(1)[0]
+                    results_set[result_idx] = [
+                        x
+                        for x in results_set[result_idx]
+                        if x.get("target", "").strip() == most_common_label
+                    ]
+
             _in_domain_images = {}
+            counter = 0
             for results in results_set:
                 for result in results:
-                    result["caption"] = doc_to_target(result)
-                    result["image_path"] = result["target"]
-                    _in_domain_images[result["target"]] = doc_to_visual(result)[0]
+                    if self._format == "dynamic_pt":
+                        result["caption"] = result["target"]
+                        result["target"] += f"_{counter}"
+                        result["image_path"] = result["target"]
+                        _in_domain_images[result["target"]] = result["visual"]
+                    else:
+                        result["caption"] = doc_to_target(result)
+                        result["target"] += f"_{counter}"
+                        result["image_path"] = result["target"]
+
+                        if grab_data_type == "image":
+                            _in_domain_images[result["target"]] = doc_to_visual(result)[0]
+                    counter += 1
 
         # Retrieve target classes (text-only)
         elif search_modality == "target-classes":
-            doc_to_target = rag.get("doc_to_target")
-            test_docs = rag.get("test_docs")
-            if doc_to_target is None or test_docs is None:
-                raise ValueError(
-                    "When using 'in-domain' search modality, 'doc_to_target' and 'test_docs' must be provided in rag configuration."  # noqa: E501
-                )
-
-            targets = sorted(set(test_docs()["target"]))
-
-            results_set = [
-                {
-                    "image_path": target,  # Dummy, not actually used
-                    "caption": doc_to_target({"target": target}),
-                }
-                for target in targets
-            ]
-
+            results_set = self._get_target_classes(rag)
             # Replicate for each input image
             results_set = [results_set] * len(images)
 
@@ -324,6 +619,11 @@ class Retriever:
             all_images_keys = []
             batch_idxs = []
             for batch_idx, results in enumerate(results_set):
+                if not isinstance(results, list):
+                    raise ValueError(
+                        "Each item in results_set must be a list of retrieved results."
+                    )
+
                 image_keys = [x.get("image_path") for x in results]
                 # Enforce a limit on the maximum number of images retrieved
                 if limit is not None:
@@ -333,12 +633,22 @@ class Retriever:
                 batch_idxs.extend([batch_idx] * len(image_keys))
 
             # Extract the images
-            if search_modality in ["in-domain", "in-domain-rag"]:
+            if search_modality in ["in-domain", "in-domain-rag"] or (
+                search_modality == "random" and self._format in ["pt", "dynamic_pt"]
+            ):
                 all_retrieved_images = {
                     v: _in_domain_images[v].convert("RGB") for v in set(all_images_keys)
                 }
             else:
                 all_retrieved_images = self.get_images(all_images_keys)
+
+            if rag.get("resize_images", None) is not None:
+                for key in all_retrieved_images:
+                    image = all_retrieved_images[key]
+                    if image is not None and max(image.size) > rag["resize_images"]:
+                        all_retrieved_images[key].thumbnail(
+                            (rag["resize_images"], rag["resize_images"]), Image.LANCZOS
+                        )
 
             # Format the retrieved data for each sample
             rag_data_set = []
@@ -446,6 +756,13 @@ class Retriever:
                 for results in results_set:
                     captions = [result.get(caption_key, "").strip() for result in results]
                     rag_data = ",".join(captions)
+                    rag_data_set.append(rag_data)
+
+            elif format == "csv-spaces":
+                rag_data_set = []
+                for results in results_set:
+                    captions = [result.get(caption_key, "").strip() for result in results]
+                    rag_data = ", ".join(captions)
                     rag_data_set.append(rag_data)
 
             elif format == "cased":

@@ -1,0 +1,24 @@
+task: "caltech101_majority_voting_32_shot_vitb32"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "Label:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "caltech101/train/openai-clip-vit-base-patch32"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "{}"
+
+    database_format: "pt"
+    search_modality: "in-domain-rag"
+    grab_data_type: "text"
+    format: "newlines"
+    num_samples: 32
+    num_shots_per_class: 32
+include: assets/_default_template_yaml

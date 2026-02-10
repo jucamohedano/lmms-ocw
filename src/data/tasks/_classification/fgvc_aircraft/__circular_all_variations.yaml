@@ -1,0 +1,71 @@
+task: "fgvc_aircraft_circular"
+
+doc_to_text: !function assets/_fgvc_aircraft_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - "Your task is to identify the *semantic category* of the main object in the image.\nAnswer concisely with one or two words only.\nAnswer:"
+      # - "Task: Using the examples only as guidance, and referring to the previous labels, refine the label for the TARGET image by making it more specific.\nAdd only **one new label** to the provided ones. Do not repeat previous labels.\nOutput must be the new label only."
+      - "Task: Using the context to infer what **distinctions** matter within this domain, **refine** the label for the TARGET image accordingly.\nLabel: "
+      # - "Labels: "
+      - "Task:\nClassify the TARGET image using the context to guide what level of specificity to use.\nProduce a label that fits naturally among the context labels."
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    0:
+      enabled: True
+      database_path: "fgvc_aircraft/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      prompt: "<images>"
+      database_format: "pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 16
+      separate_queries: True
+      cache_and_reuse: True
+
+    1:
+      enabled: True
+      pipe_from: -1
+      separate_queries: True
+      format: "all-image-answer-pairs"
+      #
+      # context_prompt: "You are a classifier performing iterative refinement.\nAt each step, you make the current label slightly more specific than in the previous iteration, using the context of other labeled images as a reference.\n\nOnly **add one additional level** of specificity (e.g., 'animal' becomes 'dog', 'animal, dog' becomes 'labrador'). Keep the output concise, one or two words.\n\nContext (previously labeled examples):"
+      context_prompt: "You are given a set of image-label pairs that belong to the *same unknown domain*.\nYour goal is to infer what kind of distinctions matter within this domain and refine the label of a target image accordingly.\n\nGuidelines:\n- Assume all examples belong to a coherent category space (they share a theme).\n- Look for visual patterns that differ among examples (shape, texture, color, part structure).\n- \"Refine\" means making the target label more specific *within the apparent domain* inferred from context, not globally (avoid generic words like \"vehicle\" or \"object\").\n- Do not simply repeat the previous label; add or substitute information that makes it more discriminative among the context samples.\n- Keep the label concise: usually one or two words.\n\nContext examples (from previous iteration):"
+      # prompt: "Current labels: {}\n"
+      prompt: "Label: {}\n"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      # prompt_for_sample: "Current labels: {}\n"
+      prompt_for_sample: "Previous label: {}\n"
+      keep_label_for_hot_image: True
+      keep_full_history: True
+      concatenate_labels: ", "
+      # keep_full_history: False
+      clean_output_labels: True
+      #
+      circular: True
+      max_iters: 3
+      cache_and_reuse: True
+      gen_batch_size: 2 # Process one item at a time when generating, to avoid OOM
+
+    2:
+      enabled: True
+      pipe_from: 1
+      #
+      # prompt: "You are a classifier capable of providing labels at varying levels of specificity.\nUsing the examples below as a guide, provide a list of labels for the TARGET image that classify it from general to specific.\n\nHere are some examples of output labels:\n<images>Labels: {}"
+      prompt: "You are an open-world visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them to infer what kinds of distinctions matter in this domain (e.g., texture patterns, object subtypes, material differences, color or shape features).\n\nYour task is to classify a new image from the same domain.\nMatch the level of specificity shown in the context labels.\nAvoid generic words such as \"object\", \"thing\", \"vehicle\", \"animal\", \"texture\" unless they are the most specific category possible\n\nAnswer concisely with one or two words.\n<images>Label: {}"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      keep_full_history: True
+      concatenate_labels: ", "
+      #
+      format: "interleaved"
+      include_image: True # Since step 0 and 1 do not put it into the context
+
+include: assets/_default_template_yaml

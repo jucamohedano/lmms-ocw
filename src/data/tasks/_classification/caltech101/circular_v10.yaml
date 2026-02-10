@@ -1,0 +1,71 @@
+task: "caltech101_circular_v10"
+
+doc_to_text: !function assets/_caltech101_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - "You are an expert at categorizing images based on their primary broad semantic category, focusing on the main subject (e.g., object, animal, vehicle, plant, scene, texture). Keep it very general—avoid specifics like species or models.\nOutput only the category in 1-2 words, nothing else. Examples:\nDog photo: \"animal\"\nCar: \"vehicle\"\nRose close-up: \"plant\"\nOcean view: \"scene\"\nStriped fabric: \"texture\"\nAirplane: \"vehicle\"\nWatch: \"accessory\"\nBarrel: \"container\"\n\nCategory for this image:"
+      - "Refine progressively more specific than last, adding detail.\nLabel:"
+      - "Classify TARGET with matching hierarchical label.\nLabel:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  resize_input_image: 224
+  rag:
+    0:
+      enabled: True
+      database_path: "caltech101/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      prompt: "<images>"
+      database_format: "pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 16
+      separate_queries: True
+      cache_and_reuse: True
+
+      gen_batch_size: 4
+    1:
+      enabled: True
+      pipe_from: -1
+      separate_queries: True
+      format: "all-image-answer-pairs"
+      #
+      system_prompt: "You are an expert in open-world visual domain discovery and iterative label refinement. For each iteration, infer the domain from all images (e.g., object classes, subtypes). Refine the target’s label by making it progressively more specific than the previous one, adding discriminative details (e.g., subtype, attribute) based on visual differences.\nInternal Reasoning:\n- Infer domain (e.g., \"tools\" if varied implements).\n- Spot distinctions (shape, color, features).\n- Build on history: Always evolve—add subtype or visual descriptor if already specific (e.g., \"scissors\" → \"office scissors\").\n- Use 1-2 words; avoid repetition.\n\nGuidelines:\n- Refine within domain; add info each time.\n- Output only: \"Label: [1-2 words]\".\n\nExamples:\n- Domain: vehicles; History: \"vehicle\"; Context varies → Label: motorcycle\n- Domain: animals; History: \"animal\"; → Label: elephant\n- Domain: animals; History: \"animal, elephant\"; → Label: African elephant"
+      context_prompt: "Context examples (same domain, previous iteration):\n"
+      prompt: "Labels: {}\n"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      prompt_for_sample: "Current labels: {}\n"
+      #
+      keep_label_for_hot_image: True
+      keep_full_history: True
+      concatenate_labels: ", "
+      clean_output_labels: True
+      circular: True
+      max_iters: 3
+      cache_and_reuse: True
+      gen_batch_size: 4 # Process one item at a time when generating, to avoid OOM
+      resize_images: 224
+
+    2:
+      enabled: True
+      pipe_from: 1
+      #
+      system_prompt: "You are an open-world visual classifier for hierarchical labeling. Given image-label pairs from the same domain (e.g., object subtypes, flower species, scene types, texture patterns), infer the domain via visual patterns and label styles.\nTask: Classify the target image hierarchically: comma-separated levels from broad to specific (e.g., \"flower, rose\"), matching context specificity.\nInternal Reasoning:\n\n- Infer domain (e.g., \"flower species\" from labels like \"flower, daisy\").\n- Compare target features (shape, color, etc.) to examples.\n- Build 2-4 level hierarchy using context-like terms; avoid generics.\n\nGuidelines:\n- Output only: \"[hierarchy]\".\n- Use precise, standard terms for accuracy."
+      prompt: "Context examples (same domain):\n<images>Label: {}"
+      # prompt: "You are an open-world visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them to infer what kinds of distinctions matter in this domain (e.g., texture patterns, object subtypes, material differences, color or shape features).\n\nYour task is to classify a new image from the same domain.\nMatch the level of specificity shown in the context labels.\nAvoid generic words such as \"object\", \"thing\", \"vehicle\", \"animal\", \"texture\" unless they are the most specific category possible\n\nAnswer concisely with the list of coarse to fine-grained categories, following these examples:\n===== EXAMPLES START =====\n{}\n===== EXAMPLES END ====="
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      keep_full_history: True
+      concatenate_labels: ", "
+      format: "interleaved"
+      resize_images: 224
+      clean_answer: True
+      include_image: True # Since step 0 and 1 do not put it into the context
+
+include: assets/_default_template_yaml

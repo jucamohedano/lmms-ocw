@@ -1,0 +1,39 @@
+task: "stanford_cars_two_passes_with_images_v2"
+
+doc_to_text: !function assets/_stanford_cars_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - What object is in this image? Provide a concise and specific caption.
+      - What object is in this image? Provide a concise and specific caption.
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    0:
+      enabled: True
+      database_path: "stanford_cars/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      prompt: "<images>"
+      database_format: "pt"
+      # search_modality: "in-domain-rag"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 4
+      separate_queries: True
+
+    1:
+      enabled: True
+      pipe_from: 0
+      # prompt: "Answering the question 'What object is in this image?' for similar images, you provided these answers:\n{}"
+      prompt: "Here are some examples of input-output pairs:\n<images>Answer: {}"
+      format: "interleaved"
+      include_image: True # Since step 0 does not put it into the context
+
+include: assets/_default_template_yaml

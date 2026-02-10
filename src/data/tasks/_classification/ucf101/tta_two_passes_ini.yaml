@@ -1,0 +1,46 @@
+task: "ucf101_tta_two_passes_ini"
+
+doc_to_text: !function assets/_ucf101_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - "What object is in this image?"
+      - "What object is in this image? Be more specific"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  resize_input_image: 224
+  rag:
+    0:
+      enabled: True
+      database_path: "ucf101/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      prompt: "<images>"
+      database_format: "dynamic_pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 16
+      separate_queries: True
+      cache_and_reuse: True
+      include_input_separately: True # Don't actually need it, but it ensures the code doesn't break
+      remove_input_if_match_num_samples: True # To avoid putting the input in the context when num_samples is large enough
+      resize_images: 224
+
+    1:
+      enabled: True
+      pipe_from: 0
+      prompt: "You are an open-world visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them to infer what kinds of distinctions matter in this domain (e.g., texture patterns, object subtypes, material differences, color or shape features).\n\nYour task is to classify a new image from the same domain.\nMatch the level of specificity shown in the context labels.\nAvoid generic words such as \"object\", \"thing\", \"vehicle\", \"animal\", \"texture\" unless they are the most specific category possible\n\nAnswer concisely with one or two words.\n<images>Label: {}"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      format: "interleaved"
+      resize_images: 224
+      include_image: True
+      store_memory: True
+      reset_cache: 8
+
+include: assets/_default_template_yaml

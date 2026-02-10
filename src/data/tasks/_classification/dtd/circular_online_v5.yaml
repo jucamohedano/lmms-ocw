@@ -1,0 +1,83 @@
+task: "dtd_circular_online_v5"
+
+doc_to_text: !function assets/_dtd_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - "Your task is to identify the *broad semantic category* of the main object in each image.\nAnswer concisely with one or two words only, such as \"animal\", \"vehicle\", \"fruit\", \"tool\".\nAnswer:"
+      - "Task: Using the context to infer what distinctions matter within this domain, refine the label for the TARGET image accordingly.\nLabel: "
+      - "Task:\nClassify the TARGET image using the context to guide what level of specificity to use.\nProduce a label that fits naturally among the context labels."
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    0:
+      enabled: True
+      database_path: "dtd/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      # system_prompt: ""
+      prompt: "<images>"
+      database_format: "pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 15 #15
+      separate_queries: True
+      cache_and_reuse: True
+      # reuse_retrieved: True  # Reuse retrieved items across rounds
+      include_input: True # Include the image to be classified in the retrieved set
+
+    1:
+      enabled: True
+      pipe_from: -1
+      separate_queries: True
+      format: "all-image-answer-pairs"
+      # system_prompt: ""
+      context_prompt: "You are performing open-world visual classification with iterative refinement. You are given a small set of image-label pairs that belong to the same unknown domain. Your job is to infer what distinctions matter in that domain and produce a concise hierarchical label for the TARGET image, ending with the most specific (fine-grained) class name.\n\nRules\n- Assume all context examples share a coherent theme. Use those examples to decide which distinctions matter (type, style, species, part type, period, etc.).\n- Output a short comma-separated hierarchy (2-3 terms). Order: broad category, narrower class, most specific class (fine-grained). Example format: \"vehicle, airplane, airliner\".\n- The rightmost term MUST be the most specific, common-name label (1-2 words). This final term should be the refined target label.\n- Be concise. Use 2-3 terms total. Avoid adding unrelated descriptors (e.g., \"transportation\", \"altitude\", \"flight\") unless they are the best fine-grained class.\n- Don’t simply repeat a previous coarse label. Refine down to a specific class visible in the image (e.g., \"minaret\" instead of \"tower\"; \"trilobite\" instead of \"fossil\"; \"schooner\" instead of \"boat\").\n- Prefer standard common names for species/objects (e.g., \"butterfly\", \"menorah\", \"ew er\", \"gramophone\", \"revolver\"). Use brand names only if they are clearly the most specific, correct label.\n- If the image is already at a fine-grained level, still follow the format: broad, narrow, fine (the fine-grained term should be the rightmost token).\n- Output only the label string (no explanation, no extra punctuation).\n"
+      prompt: "Current labels: {}"
+      end_context_prompt: "TARGET:"
+      prompt_for_sample: "Current labels: {}\n"
+      keep_label_for_hot_image: True
+      keep_full_history: True
+      concatenate_labels: ", "
+      clean_output_labels: True
+      circular: True
+      max_iters: 3
+      cache_and_reuse: False
+      gen_batch_size: 16 # Process one item at a time when generating, to avoid OOM
+      include_input: True # Include the image to be classified in the retrieved set
+      resize_images: 224
+
+    # 2:
+    #   enabled: True
+    #   pipe_from: 1
+    #   passthrough: True
+    #   grab_outputs_from: -1  # get the outputs generated for the first image, i.e., the TARGET image
+    #   concatenate_labels: ", "
+
+    2:
+      enabled: True
+      pipe_from: 1
+      # system_prompt: ""
+      prompt: "You are an open-world visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them to infer what kinds of distinctions matter in this domain (e.g., texture patterns, object subtypes, material differences, color or shape features).\n\nYour task is to classify a new image from the same domain.\nMatch the level of specificity shown in the context labels.\nAvoid generic words such as \"object\", \"thing\", \"vehicle\", \"animal\", \"texture\" unless they are the most specific category possible\n\nAnswer concisely with one or two words.\n<images>Label: {}"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      keep_full_history: True
+      concatenate_labels: ", "
+      format: "interleaved"
+      # resize_images: 300  # max size, either width or height, keeping aspect ratio
+      #
+      # system_prompt: "You are a helpful assistant specialized in classifying the main object in images from various domains. Focus solely on the central subject—ignore backgrounds, settings, secondary elements, scenes, or unrelated details. Never include them. Output only a concise, comma-separated hierarchical list from broad to specific (e.g., \"general category, subcategory, specific type, key trait\"). Use exactly 3-6 unique terms—no more, no less. No repetitions, no duplicates, no synonyms. No prefixes like \"Classification:\" or any extra text."
+      # prompt: "You have examples of classifications from images in the same domain:\n{}\n\nThese represent the typical subjects and detail level in this domain. Now, classify this new image accordingly:"
+      # prompt: "Here are classifications of main objects from the same domain—use them to infer the typical style and specificity:\n{}\n\nClassify the main object in this new image in the same concise, focused style—only the central subject, no backgrounds or extras:"
+      #
+      # format: "bullet-list-captions"
+      include_image: True # Since step 0 and 1 do not put it into the context
+      exclude_rag_message: -1
+
+    #   resize_images: 308
+include: assets/_default_template_yaml

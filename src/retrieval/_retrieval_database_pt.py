@@ -1,4 +1,6 @@
+import copy
 import json
+import random
 from pathlib import Path
 
 import torch
@@ -31,6 +33,41 @@ class RetrievalTensorDatabase:
         self._embeddings = self._embeddings.t()  # Transpose for easier matmul
         with open(metadata) as f:
             self._metadata = json.load(f)
+            self._original_metadata = copy.deepcopy(self._metadata)
+
+    def _group_by_target(self) -> dict:
+        """Group the database entries by their target labels."""
+        grouped = {}
+        for key, meta in self._original_metadata.items():
+            target = meta.get("target")
+            if target not in grouped:
+                grouped[target] = []
+            grouped[target].append(key)
+        return grouped
+
+    def few_shot(self, num_shots: int) -> None:
+        """Restrict the database to few-shot examples.
+
+        Args:
+        ----
+            num_shots (int): Number of shots per class to keep.
+
+        """
+        grouped = self._group_by_target()
+
+        few_shot_examples = {}
+        all_selected_keys = []
+        new_idx = 0
+        for _, keys in grouped.items():
+            selected_keys = random.sample(keys, min(num_shots, len(keys)))
+            all_selected_keys.extend([int(x) for x in selected_keys])
+            for key in selected_keys:
+                few_shot_examples[str(new_idx)] = self._original_metadata[key]
+                new_idx += 1
+
+        self._metadata = few_shot_examples
+
+        self._embeddings = self._embeddings.T[all_selected_keys].t()
 
     @property
     def _metadata_provider(self) -> str:
@@ -38,7 +75,7 @@ class RetrievalTensorDatabase:
         return self._metadata
 
     def _find_closest(
-        self, query: torch.Tensor, k: int = 10, batch_size: int = 1024
+        self, query: torch.Tensor, k: int = 10, batch_size: int = 2048
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Find the k closest samples in the database to the query tensor.
 
@@ -50,11 +87,11 @@ class RetrievalTensorDatabase:
 
         """
         query = query.to(self._device)
-        N = self._embeddings.shape[0]
+        N = self._embeddings.shape[1]
 
         similarities = []
         for i in range(0, N, batch_size):
-            batch = self._embeddings[i : i + batch_size]
+            batch = self._embeddings[:, i : i + batch_size]
             # (#queries, emb_dim) x (emb_dim, #batch) -> (#queries, #batch)
             sim = torch.matmul(query, batch)
             similarities.append(sim.cpu())
@@ -68,7 +105,7 @@ class RetrievalTensorDatabase:
         self,
         query: torch.Tensor,
         num_samples: int = 10,
-        batch_size: int = 1024,
+        batch_size: int = 2048,
         **kwargs,
     ) -> list[list[dict]]:
         """Query the database with a tensor and return the closest samples.
@@ -87,7 +124,7 @@ class RetrievalTensorDatabase:
         for dists, inds in zip(distances, indices, strict=True):
             res = []
             for dist, ind in zip(dists, inds, strict=True):
-                meta = self._metadata[str(ind.item())]
+                meta = copy.deepcopy(self._metadata[str(ind.item())])
                 meta["distance"] = dist.item()
                 res.append(meta)
             results.append(res)

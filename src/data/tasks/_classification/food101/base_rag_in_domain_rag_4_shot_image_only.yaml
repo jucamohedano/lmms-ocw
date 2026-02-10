@@ -1,0 +1,23 @@
+task: "food101_rag_in_domain_rag_4_shot_image_only"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "All these images show the same object. What object is it? Provide only its name. Be as specific as possible."
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "food101/train/openai-clip-vit-base-patch32"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "<images>"
+
+    database_format: "pt"
+    search_modality: "in-domain-rag"
+    grab_data_type: "image"
+    format: "no-text"
+    num_samples: 4
+include: assets/_default_template_yaml

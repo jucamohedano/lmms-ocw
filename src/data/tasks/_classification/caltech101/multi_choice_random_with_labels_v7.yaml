@@ -1,0 +1,88 @@
+task: "caltech101_multi_choice_random_with_labels_v7"
+
+doc_to_text: !function assets/_caltech101_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - "Your task is to identify the *broad semantic category* of the main object in each image.\nAnswer concisely with one or two words only, such as \"animal\", \"vehicle\", \"fruit\", \"tool\".\nAnswer:"
+      - "Task: Using the context to infer what distinctions matter within this domain, refine the label for the TARGET image accordingly.\nLabel: "
+      - "Answer:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  resize_input_image: 224
+  rag:
+    0:
+      enabled: True
+      database_path: "caltech101/train/openai-clip-vit-base-patch32" # no need for DB path, it's constructed dynamically # "caltech101/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      # system_prompt: "You are a precise image classifier. Classify the given image into **exactly one** of the categories below. Output **only the chosen category name**, nothing else."
+      prompt: "<images>"
+      database_format: "pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 4
+      separate_queries: True
+      cache_and_reuse: True
+      include_target_classes: "pre-query"
+      target_classes_format: "bullet-list"
+      target_classes_prompt: "Categories (choose exactly one):\n{}"
+
+    1:
+      enabled: True
+      pipe_from: -1
+      separate_queries: True
+      format: "all-image-answer-pairs"
+      # system_prompt: "You are a precise image classifier. Classify the given image into **exactly one** of the categories below. Output **only the chosen category name**, nothing else."
+      context_prompt: "You are performing open-world visual classification with iterative refinement.\nYou are given a small set of image-label pairs that belong to the *same unknown domain*.\nYour goal is to infer what kind of distinctions matter within this domain and refine the label of a target image accordingly.\n\nGuidelines:\n- Assume all examples belong to a coherent category space (they share a theme).\n- Look for visual patterns that differ among examples (shape, texture, color, part structure).\n- \"Refine\" means making the target label more specific *within the apparent domain* inferred from context, not globally (avoid generic words like \"vehicle\" or \"object\").\n- Do not simply repeat the previous label; add or substitute information that makes it more discriminative among the context samples.\n- Keep the label concise: usually one or two words.\n\nContext examples (from previous iteration):"
+      prompt: "Current labels: {}\n"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      prompt_for_sample: "Current labels: {}\n"
+      keep_label_for_hot_image: True
+      keep_full_history: True
+      concatenate_labels: ", "
+      clean_output_labels: True
+      circular: True
+      max_iters: 3
+      cache_and_reuse: True
+      gen_batch_size: 16 # Process one item at a time when generating, to avoid OOM
+      resize_images: 224
+      include_target_classes: "pre-query"
+      target_classes_format: "bullet-list"
+      target_classes_prompt: "Categories (choose exactly one):\n{}"
+
+    2:
+      enabled: True
+      pipe_from: 1
+      #
+      prompt: "You are an open-world visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them as a support in choosing the right category from the given list.\n\nYour task is to classify a new image from the same domain.\nChoose exactly one category from the list below.<images>Pseudo-label: {}"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      #
+      # prompt: "<images>{}"
+      # end_context_prompt: "What object is in the photo?"
+      #
+      # prompt: "You are a visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them as a support in choosing the right category from the given list.\n\nYour task is to classify a new image from the same domain.\nChoose exactly one category from the list below.<images>Label: {}"
+      # end_context_prompt: "What object is in the photo?"
+      #
+      # prompt: "You are a visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them as a support in choosing the right category from the given list.\n\nYour task is to classify a new image from the same domain.\nChoose exactly one category from the list below.<images>Label: {}"
+      # end_context_prompt: "===== EXAMPLES END =====\nWhat object is in the photo?"
+      #
+      # prompt: "You are a visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them as a support in choosing the right category from the given list.\n\nYour task is to classify a new image from the same domain.\nChoose exactly one category from the list below.<images>Label: {}"
+      # end_context_prompt: "===== EXAMPLES END =====\nTARGET:\nWhat object is in the photo?"
+      #
+      keep_full_history: True
+      concatenate_labels: ", "
+      format: "interleaved"
+      resize_images: 224 # max size, either width or height, keeping aspect ratio
+      include_image: True # Since step 0 and 1 do not put it into the context
+      include_target_classes: "pre-query"
+      target_classes_format: "bullet-list"
+      target_classes_prompt: "Categories (choose exactly one):\n{}"
+
+include: assets/_default_template_yaml

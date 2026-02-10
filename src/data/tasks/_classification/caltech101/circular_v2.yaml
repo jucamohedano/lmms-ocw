@@ -1,0 +1,75 @@
+task: "caltech101_circular_v2"
+
+doc_to_text: !function assets/_caltech101_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      # Pseudo-labelling step
+      - "What type of object is in this photo?"
+      # Circular step
+      - "Using the style and level of detail above, rewrite its caption to be slightly more specific and visually grounded.\nKeep the **main object** as the **subject**. Focus only on the main object."
+      # - "What differentiates this image from the others? Briefly state what makes it visually distinct from the others. Focus on unique shape, texture, or function traits."
+      # Classification step
+      - "What type of object is in this photo? Write one fluent, descriptive caption at the same level of specificity."
+      # Classification refinement step
+      - "Rewrite your answer following this output format:\nThis photo contains a [noun]. [brief, concise and specific description]."
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    0:
+      enabled: True
+      database_path: "caltech101/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      system_prompt: "You are a helpful visual classifier."
+      prompt: "<images>"
+      database_format: "pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 8
+      separate_queries: True
+      cache_and_reuse: True
+
+    1:
+      enabled: True
+      pipe_from: -1
+      separate_queries: True
+      format: "all-image-answer-pairs"
+      #
+      system_prompt: "You are a meticulous visual taxonomist refining image captions.\n\nYou will see several images and their preliminary captions.\nAll images belong to the same general domain, but the captions are still coarse.\nYour goal is to rewrite each caption to make it more specific and descriptive, focusing on the same main object but adding subtle visual or functional details that distinguish it from the others.\nDo not invent information not visible in the image.\nWrite full sentences, not lists of words.\n\nFocus your refinement on visual details of the main object itself (shape, color, texture, subtype, material).\nIgnore or minimize mention of the background or setting unless it helps identify the object.\nKeep the description concise (15-25 words)."
+      context_prompt: "Here are the current image-caption pairs:"
+      prompt: "Caption: {}\n"
+      end_context_prompt: "Now focus on the image below."
+      prompt_for_sample: "Current caption: {}\n"
+      #
+      keep_label_for_hot_image: True
+      keep_full_history: False
+      # concatenate_labels: ", "
+      clean_output_labels: False
+      #
+      circular: True
+      max_iters: 3
+      cache_and_reuse: True
+      gen_batch_size: 16 # Process one item at a time when generating, to avoid OOM
+
+    2:
+      enabled: True
+      pipe_from: 1
+      #
+      system_prompt: "You are a fine-grained visual classifier.\nYou will see several refined captions from the same domain.\nInfer the level of detail and style, but when describing the new image, focus on the **main object** and its **distinguishing visual features**.\nAvoid discussing background elements unless they are essential for recognition.\nAnswer in one concise, natural-sounding sentence centered on the main object."
+      prompt: "Reference captions:\n{}\n\nTarget image:\n"
+      #
+      format: "bullet-list-captions"
+      include_image: True # Since step 0 and 1 do not put it into the context
+
+    3:
+      enabled: False
+      pipe_from: 2
+
+include: assets/_default_template_yaml

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import secrets
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -217,6 +218,8 @@ class EngineTracker:
         self.results_repo = f"{hub_results_org}/{results_repo_name}"
         self.results_repo_private = f"{hub_results_org}/{results_repo_name}-private"
 
+        self.random_id = secrets.randbelow(1_000_000)
+
     def save_results_aggregated(self, results: dict, samples: dict, datetime_str: str) -> None:
         """Save the aggregated results and samples.
 
@@ -258,7 +261,9 @@ class EngineTracker:
                 path.mkdir(parents=True, exist_ok=True)
 
                 self.date_id = datetime_str.replace(":", "-")
-                file_results_aggregated = path.joinpath(f"{self.date_id}_results.json")
+                file_results_aggregated = path.joinpath(
+                    f"{self.date_id}_{self.random_id}_results.json"
+                )
                 file_results_aggregated.open("w", encoding="utf-8").write(dumped)
 
                 if self.api and self.push_results_to_hub:
@@ -271,10 +276,12 @@ class EngineTracker:
                     )
                     self.api.upload_file(
                         repo_id=repo_id,
-                        path_or_fileobj=str(path.joinpath(f"{self.date_id}_results.json")),
+                        path_or_fileobj=str(
+                            path.joinpath(f"{self.date_id}_{self.random_id}_results.json")
+                        ),
                         path_in_repo=os.path.join(
                             self.general_config_tracker.model_name,
-                            f"{self.date_id}_results.json",
+                            f"{self.date_id}_{self.random_id}_results.json",
                         ),
                         repo_type="dataset",
                         commit_message=(
@@ -311,7 +318,9 @@ class EngineTracker:
                 path = path.joinpath(self.general_config_tracker.model_name_sanitized)
                 path.mkdir(parents=True, exist_ok=True)
 
-                file_results_samples = path.joinpath(f"{self.date_id}_samples_{task_name}.jsonl")
+                file_results_samples = path.joinpath(
+                    f"{self.date_id}_{self.random_id}_samples_{task_name}.jsonl"
+                )
 
                 for sample in samples:
                     # We first need to sanitize arguments and response otherwise we won't be able

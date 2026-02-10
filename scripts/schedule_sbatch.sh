@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034
 set -o errexit
 set -o nounset
 set -o pipefail
@@ -32,6 +33,8 @@ Evaluation options:
     --models-args <ARGS>         Comma-separated extra args for the models
     --no-samples                 Disable logging samples to disk
     --no-wandb                   Disable logging to Weights & Biases
+    --predict-only               Do not evaluate metrics
+    --seed <SEED>                Set random seed for reproducibility
     -o --output <OUTPUT>         Results output dir (default: "logs/schedule")
 
 '
@@ -61,6 +64,8 @@ EVAL_SAMPLES_LIMIT=""
 EVAL_SAMPLES_LOGGING=true
 EVAL_WANDB_LOGGING=true
 EVAL_WANDB_ARGS="project=lmms-owc,job_type=eval"
+EVAL_PREDICT_ONLY=""
+EVAL_SEED="0,1234,1234,1234"
 
 main() {
     while [[ $# -gt 0 ]]; do
@@ -84,6 +89,8 @@ main() {
             --batch-size) EVAL_BATCH_SIZE="$2"; shift 2 ;;
             --no-samples) EVAL_SAMPLES_LOGGING=false; shift;;
             --no-wandb) EVAL_WANDB_LOGGING=false; shift;;
+            --predict-only) EVAL_PREDICT_ONLY=true; shift ;;
+            --seed) EVAL_SEED="$2"; shift 2 ;;
             -o|--output) EVAL_OUTPUT_DIR="$2"; shift 2 ;;
             *) echo "Error: unknown option: $1" >&2; exit 1 ;;
         esac
@@ -168,6 +175,11 @@ fi
 EVAL_EXTRA_ARGS=""
 EVAL_EXTRA_ARGS="\$EVAL_EXTRA_ARGS --batch_size $EVAL_BATCH_SIZE"
 EVAL_EXTRA_ARGS="\$EVAL_EXTRA_ARGS --output_path \$EVAL_OUTPUT_DIR/\$task/\$model"
+EVAL_EXTRA_ARGS="\$EVAL_EXTRA_ARGS --seed $EVAL_SEED"
+
+if [ "\$EVAL_PREDICT_ONLY" ]; then
+    EVAL_EXTRA_ARGS="\$EVAL_EXTRA_ARGS --predict_only"
+fi
 
 if [ "\$EVAL_MODELS_ARGS" ]; then
     EVAL_EXTRA_ARGS="\$EVAL_EXTRA_ARGS --model_args \$EVAL_MODELS_ARGS"

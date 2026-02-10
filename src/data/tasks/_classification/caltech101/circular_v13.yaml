@@ -1,0 +1,71 @@
+task: "caltech101_circular_v13"
+
+doc_to_text: !function assets/_caltech101_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - "Identify the broad semantic category of the main subject in the image (e.g., animal, vehicle, plant, scene, texture). Use general, lowercase terms only\u20141-2 words, no specifics.\nOutput only: 1-2 words. Examples:\n- Dog: animal\n- Car: vehicle\n- Rose: plant\n- Beach: scene\n- Fabric: texture\n- Jet: vehicle\n- Watch: accessory\n- Barrel: container"
+      - "Refine: narrow to subcategory."
+      - "Classify TARGET with 3-4 level hierarchy."
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  resize_input_image: 224
+  rag:
+    0:
+      enabled: True
+      database_path: "caltech101/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      prompt: "<images>"
+      database_format: "pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 16
+      separate_queries: True
+      cache_and_reuse: True
+
+      gen_batch_size: 4
+    1:
+      enabled: True
+      pipe_from: -1
+      separate_queries: True
+      format: "all-image-answer-pairs"
+      #
+      system_prompt: "You are an expert in visual domain inference and label refinement. Infer domain from images (e.g., object types, animal species). Refine target by adding a stricter subcategory each iteration, using standard nouns\u2014no repeats, no attributes (e.g., color).\nInternal Reasoning:\n- Infer domain.\n- Identify subclass differences.\n- Evolve history: Narrow strictly (e.g., animal \u2192 mammal; mammal \u2192 lion).\n- 1-2 words; ensure progression.\n\nGuidelines:\n- Refine within domain, use common terms.\n- Output only: 1-2 words.\n\nExamples:\n- History: vehicle \u2192 motorcycle\n- History: vehicle, motorcycle \u2192 cruiser\n- History: animal \u2192 reptile\n- History: animal, reptile \u2192 turtle"
+      context_prompt: "Context (same domain):\n"
+      prompt: "Labels: {}\n"
+      end_context_prompt: "===== END =====\nTARGET:"
+      prompt_for_sample: "Labels: {}\n"
+      #
+      keep_label_for_hot_image: True
+      keep_full_history: True
+      concatenate_labels: ", "
+      clean_output_labels: True
+      circular: True
+      max_iters: 3
+      cache_and_reuse: True
+      gen_batch_size: 4 # Process one item at a time when generating, to avoid OOM
+      resize_images: 224
+
+    2:
+      enabled: True
+      pipe_from: 1
+      #
+      system_prompt: "You are a visual classifier for hierarchical labels. Infer domain from examples. Classify target with comma-separated hierarchy (3-4 levels, broad to specific), using context nouns for precise, dataset-aligned terms.\nInternal Reasoning:\n- Infer domain/subclass patterns.\n- Match visuals to deepen hierarchy.\n- Build levels: Start general, add specifics like context.\n\nGuidelines:\n- Output only: comma-separated hierarchy.\n- Use standard, GT-like nouns.\n\nExamples:\n- Context: vehicle, motorcycle, cruiser; vehicle, airplane, jetliner \u2192 vehicle, car, sedan\n- Context: animal, mammal, elephant; animal, bird, flamingo \u2192 animal, mammal, lion"
+      prompt: "Context:\n<images>{}"
+      # prompt: "You are an open-world visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them to infer what kinds of distinctions matter in this domain (e.g., texture patterns, object subtypes, material differences, color or shape features).\n\nYour task is to classify a new image from the same domain.\nMatch the level of specificity shown in the context labels.\nAvoid generic words such as \"object\", \"thing\", \"vehicle\", \"animal\", \"texture\" unless they are the most specific category possible\n\nAnswer concisely with the list of coarse to fine-grained categories, following these examples:\n===== EXAMPLES START =====\n{}\n===== EXAMPLES END ====="
+      end_context_prompt: "===== END =====\nTARGET:"
+      keep_full_history: True
+      concatenate_labels: ", "
+      format: "interleaved"
+      resize_images: 224
+      clean_answer: True
+      include_image: True # Since step 0 and 1 do not put it into the context
+
+include: assets/_default_template_yaml

@@ -1,3 +1,4 @@
+import json
 import random
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
@@ -36,6 +37,9 @@ def main(args: Namespace) -> None:
     # Resolve globs on the args.input
     input_paths = sorted(Path().glob(args.input)) if "*" in args.input else [Path(args.input)]
 
+    if args.keep_only_last_log:
+        input_paths = input_paths[-1:]
+
     # Find all the *_samples_*.jsonl files
     input_files_per_path = [
         list(input_path.glob("**/*_samples_*.jsonl")) if input_path.is_dir() else [input_path]
@@ -59,6 +63,22 @@ def main(args: Namespace) -> None:
         task_name = Path(input_file).parent.parent.name
         model_name = Path(input_file).parent.name
 
+        if "_" in Path(input_file).name:
+            name_parts = Path(input_file).name.split("_")
+
+            # Support for runs with a random number in the file name
+            if len(name_parts) > 2 and name_parts[2].isdigit():
+                result_file = Path(input_file).parent / (
+                    "_".join(name_parts[:3]) + "_results.json"
+                )
+            else:
+                result_file = Path(input_file).parent / (
+                    "_".join(name_parts[:2]) + "_results.json"
+                )
+        else:
+            result_file = Path(input_file).parent / "results.json"
+        log.debug("Corresponding result file: %s", result_file)
+
         df = pd.read_json(input_file, lines=True)
         predictions = df["filtered_resps"].tolist()
         references = df["target"].tolist()
@@ -79,9 +99,22 @@ def main(args: Namespace) -> None:
                 model_name,
             )
             metric_info = get_metric_info(metric_name)
-            if metric_info.name in ["textual_inclusion"]:
-                predictions = [prediction[-1] for prediction in predictions]
-                output = metric_info.builder_fn(predictions, references)
+            if metric_info.name in ["textual_inclusion", "textual_iou", "accuracy", "exact_match"]:
+                actual_predictions = [prediction[-1] for prediction in predictions]
+                output = metric_info.builder_fn(actual_predictions, references)
+
+            elif metric_info.name in [
+                "median_concept_semantic_similarity",
+                "simplified_concept_semantic_similarity",
+            ]:
+                output = metric_info.builder_fn(items)
+                output = metric_info.group_fn(output)
+
+                # Save the metric
+                df[metric_info.name] = output
+
+                df.to_json(input_file, lines=True, orient="records")
+
             elif metric_info.name in metrics_to_save_intermediate_values:
                 log.warning(
                     'Setting `reduce="none"` for %s to save intermediate values', metric_info.name
@@ -152,6 +185,22 @@ def main(args: Namespace) -> None:
             if curr_task_length > prev_task_length:
                 tasks_outputs[task_name][model_name] = metric_outputs
 
+        if args.update_log:
+            with open(result_file) as f:
+                results_log = json.load(f)
+
+            for metric_k, metric_v in metric_outputs.items():
+                if metric_k.startswith("_"):
+                    continue
+
+                use_task_name = task_name
+                if task_name not in results_log["results"]:
+                    use_task_name = list(results_log["results"].keys())[0]
+                results_log["results"][use_task_name][f"{metric_k},none"] = metric_v
+
+            with open(result_file, "w") as f:
+                json.dump(results_log, f, indent=2)
+
     for task_name in tasks_outputs:
         task_outputs = tasks_outputs[task_name]
 
@@ -198,6 +247,16 @@ if __name__ == "__main__":
         type=str,
         default="INFO",
         help="Logging level (default: INFO)",
+    )
+    parser.add_argument(
+        "--update-log",
+        action="store_true",
+        help="Whether to update the summary log file corresponding to the experiments",
+    )
+    parser.add_argument(
+        "--keep-only-last-log",
+        action="store_true",
+        help="Whether to keep only the last log file corresponding to the experiments",
     )
     args = parser.parse_args()
 

@@ -1,4 +1,5 @@
 import math
+import re
 from collections.abc import Iterable
 from typing import Literal
 
@@ -255,6 +256,203 @@ def concept_semantic_similarity(
             "remove_prefix_words": True,
         },
     )
+
+    # Add the entire prediction as an extra concept
+    data = data.map(
+        lambda x: {"prediction_concepts": x["prediction_concepts"] + [x["prediction"]]}
+    )
+
+    # Get the reference-concept pairs (also include the (ref, pred) pair).
+    ref_concept_pairs = [
+        [(ref, concept) for concept in concepts]
+        for ref, concepts in zip(data["reference"], data["prediction_concepts"], strict=True)
+    ]
+
+    # Get the unique pairs and associate pairs to an index
+    unique_ref_concept_pairs = set(sum(ref_concept_pairs, []))
+    unique_ref_concept_pairs_to_idx = {
+        " | ".join(pair): idx for idx, pair in enumerate(unique_ref_concept_pairs)
+    }
+
+    # Make a dataset of unique references and concepts
+    pairs_data = datasets.Dataset.from_dict(
+        {
+            "_pair_idx": range(len(unique_ref_concept_pairs)),
+            "reference": [pair[0] for pair in unique_ref_concept_pairs],
+            "concept": [pair[1] for pair in unique_ref_concept_pairs],
+        }
+    )
+    pairs_data.set_format("torch")
+
+    # Encode pairs with sentence bert
+    pairs_data = pairs_data.map(
+        encode_sentence_bert,
+        batched=True,
+        batch_size=1024,
+        fn_kwargs={"input_column": "reference"},
+    )
+    pairs_data = pairs_data.map(
+        encode_sentence_bert,
+        batched=True,
+        batch_size=1024,
+        fn_kwargs={"input_column": "concept"},
+    )
+
+    # Get the semantic similarities
+    refs_z = pairs_data["reference_sentence_bert_embeds"].unsqueeze(1)
+    concepts_z = pairs_data["concept_sentence_bert_embeds"].unsqueeze(2)
+    similarities = torch.bmm(refs_z, concepts_z).squeeze()
+
+    # Get the similarities for each of the unique pairs.
+    ref_concept_pairs_idxs = [
+        [unique_ref_concept_pairs_to_idx[" | ".join([ref, concept])] for concept in concepts]
+        for ref, concepts in zip(data["reference"], data["prediction_concepts"], strict=True)
+    ]
+    data = data.add_column("ref_concept_pairs_idxs", ref_concept_pairs_idxs)
+    data = data.map(
+        lambda x: {"concepts_similarities": similarities[np.array(x["ref_concept_pairs_idxs"])]},
+        remove_columns=["ref_concept_pairs_idxs"],
+    )
+
+    if reduce == "max":
+        data = data.map(lambda x: {"max_concept_similarity": x["concepts_similarities"].max()})
+        return torch.mean(data["max_concept_similarity"]).item()
+    elif reduce == "mean":
+        data = data.map(lambda x: {"mean_concept_similarity": x["concepts_similarities"].mean()})
+        return torch.mean(data["mean_concept_similarity"]).item()
+    elif reduce == "median":
+        data = data.map(
+            lambda x: {"median_concept_similarity": x["concepts_similarities"].median()}
+        )
+        return torch.mean(data["median_concept_similarity"]).item()
+    elif reduce == "min":
+        data = data.map(lambda x: {"min_concept_similarity": x["concepts_similarities"].min()})
+        return torch.mean(data["min_concept_similarity"]).item()
+
+    # Return without reduction
+    concepts = data["prediction_concepts"]
+    similarities = [row.tolist() for row in data["concepts_similarities"]]
+    return list(zip(concepts, similarities, strict=True))
+
+
+@register_aggregation("concept_semantic_similarity@median")
+def concept_semantic_similarity__median(
+    items: list,
+) -> float | list[tuple[str, float]]:
+    """Median Concept Semantic Similarity.
+
+    Args:
+    ----
+        items (list): List of documents.
+
+    """
+    return concept_semantic_similarity(items, reduce="median")
+
+
+@register_aggregation("concept_semantic_similarity@min")
+def concept_semantic_similarity__min(
+    items: list,
+) -> float | list[tuple[str, float]]:
+    """Min Concept Semantic Similarity.
+
+    Args:
+    ----
+        items (list): List of documents.
+
+    """
+    return concept_semantic_similarity(items, reduce="min")
+
+
+@register_aggregation("simplified_concept_semantic_similarity")
+def simplified_concept_semantic_similarity(
+    items: list, reduce: Literal["none", "max", "mean", "median", "min"] = "max"
+) -> float | list[tuple[str, float]]:
+    """Calculate the semantic similarity of the response concepts on a list of documents.
+
+    Note: concept semantic similarity can be calculated independently per each document in a
+    benchmark. However, we evaluate it as a group-level metric as we can batch samples in the
+    forward to the spaCy model and the SentenceBERT model to speed up evaluation. For this reason,
+    we define it as an aggregation metric and pair it with a no-op passthrough metric function.
+
+    Args:
+    ----
+        items (list): List of documents.
+        reduce ("none" | "max" | "mean" | "median" | "min"): Reduction operation on the values.
+            When "none", returns the values per sample; when "max", selects the max similarity over
+            the concepts and evaluates the mean over all samples; when "mean" evaluates the mean
+            over the concepts and the mean over all samples; when "median" evaluate the median over
+            the concepts and the mean over all samples; when "mean", selects the min similarity
+            over the concepts and evaluate the mean over all samples. Defaults to "max".
+
+    """
+    from src.data.pipelines.text import encode_sentence_bert
+
+    if reduce not in ["none", "max", "mean", "median", "min"]:
+        raise ValueError(
+            "Unknown `reduce` value for `concept_semantic_similarity` metric."
+            ' Expected "none", "max", "mean", "median", or "min", but got "%s"',
+            reduce,
+        )
+
+    skip_words_groups = {
+        # Numerical terms
+        "numbers_digits": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+        "numbers_words": [
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+        ],
+        # Basic elements
+        "symbols": ["*"],
+        "articles": ["a", "the"],
+        # Common nouns
+        "generic_nouns": ["image", "object", "photo", "type", "this photo"],
+        # Pronouns and determiners
+        "personal_pronouns": ["it", "they", "them"],
+        "demonstratives": ["that", "this", "those"],
+        # Question words and relatives
+        "wh_words": ["which", "who", "whom", "whose", "where", "when", "what", "why", "how"],
+        # Quantifiers
+        "quantifiers": ["some"],
+    }
+    skip_words = [word for category in skip_words_groups.values() for word in category]
+
+    refs = list(zip(*items, strict=True))[0]
+    preds = list(zip(*items, strict=True))[1]
+
+    refs = [ref[0] if isinstance(ref, list) else ref for ref in refs]
+    preds = [pred[-1] if isinstance(pred, list) else pred for pred in preds]
+
+    def postprocess(x: str) -> str:
+        x = x.strip().replace("\n", "").replace('"', "").replace("'", "").lower()
+        x = re.sub(
+            r"History:.*|Refine:.*|[^a-zA-Z,\s]", "", x
+        )  # Remove "History:", "Refine:", quotes, etc.
+
+        return x
+
+    # Extract concepts from the predictions
+    all_concepts = []
+    for pred in preds:
+        responses = [postprocess(x) for x in pred.split(",")]
+        concepts = []
+        for r in responses:
+            if (r not in concepts and len(r) > 0) and r not in skip_words:
+                concepts.append(r)
+
+        all_concepts.append(concepts)
+
+    data = datasets.Dataset.from_dict(
+        {"prediction": preds, "reference": refs, "prediction_concepts": all_concepts}
+    )
+    data.set_format("torch")
 
     # Add the entire prediction as an extra concept
     data = data.map(
@@ -600,7 +798,7 @@ def textual_inclusion_llama32(
     data = datasets.Dataset.from_dict({"prediction": preds, "reference": refs})
     scores = data.map(
         _textual_inclusion_llama32,
-        batch_size=1024,
+        batch_size=16,  # 1024 * 4,
         batched=True,
     )["exact_match_score"]
     scores = [int(score) if score in ["0", "1"] else 0 for score in scores]

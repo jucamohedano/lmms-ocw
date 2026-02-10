@@ -14,7 +14,6 @@
 
 """Image processor class for Phi3-V."""
 
-
 import numpy as np
 from transformers import AutoImageProcessor
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature

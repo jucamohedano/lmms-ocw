@@ -1,0 +1,83 @@
+task: "dtd_circular_online_v6"
+
+doc_to_text: !function assets/_dtd_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - "Your task is to identify the *broad semantic category* of the main object in each image.\nAnswer concisely with one or two words only, such as \"animal\", \"vehicle\", \"fruit\", \"tool\".\nAnswer:"
+      - "Task: Using the context to infer what distinctions matter within this domain, refine the label for the TARGET image accordingly.\nLabel:"
+      - "Task:\nClassify the TARGET image using the context to guide what level of specificity to use.\nProduce a label that fits naturally among the context labels."
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    0:
+      enabled: True
+      database_path: "dtd/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      # system_prompt: ""
+      prompt: "<images>"
+      database_format: "pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 15 #15
+      separate_queries: True
+      cache_and_reuse: True
+      # reuse_retrieved: True  # Reuse retrieved items across rounds
+      include_input: True # Include the image to be classified in the retrieved set
+
+    1:
+      enabled: True
+      pipe_from: -1
+      separate_queries: True
+      format: "all-image-answer-pairs"
+      # system_prompt: ""
+      context_prompt: "You are doing open-world visual classification with iterative refinement.\nYou get a few image-label pairs from the same unknown domain plus a target image. Infer the domain and the granularity of distinctions from the context, then refine the target’s label.\n\nOutput format (strict):\n- Exactly 3 comma-separated labels in order: general domain, subtype, most-specific class\n- Lowercase, singular nouns only\n- No adjectives, actions, scenes, materials, or extra words\n- No more than 3 labels; do not add a fourth\n\nKey rules:\n- Make the RIGHTMOST label the narrowest, canonical object class visible in the target within the inferred domain.\n- Prefer precise common/technical names over generic terms or synonyms:\nminaret > tower; schooner/ketch > sailboat; menorah > candelabrum; trilobite > fossil; ewer > pitcher; gramophone > phonograph; tick > insect; helicopter > rotorcraft.\n- Avoid brands/proper names unless the domain consistently uses them and a clear logo/text is visible; otherwise use the generic class (e.g., airplane, motorbike).\n- If the crop is a close-up of a part or view, include it in the final label (e.g., flamingo head, crocodile head, cougar face, car side). For tight human portraits use face.\n- Focus on the central object; ignore background context."
+      prompt: "Current labels: {}\n"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      prompt_for_sample: "Current labels: {}\n"
+      keep_label_for_hot_image: True
+      keep_full_history: True
+      concatenate_labels: ", "
+      clean_output_labels: True
+      circular: True
+      max_iters: 3
+      cache_and_reuse: False
+      gen_batch_size: 16 # Process one item at a time when generating, to avoid OOM
+      include_input: True # Include the image to be classified in the retrieved set
+      resize_images: 224
+
+    # 2:
+    #   enabled: True
+    #   pipe_from: 1
+    #   passthrough: True
+    #   grab_outputs_from: -1  # get the outputs generated for the first image, i.e., the TARGET image
+    #   concatenate_labels: ", "
+
+    2:
+      enabled: True
+      pipe_from: 1
+      # system_prompt: ""
+      prompt: "You are an open-world visual classifier.\nYou will see a small set of image-label pairs that belong to the same unknown domain.\nUse them to infer what kinds of distinctions matter in this domain (e.g., texture patterns, object subtypes, material differences, color or shape features).\n\nYour task is to classify a new image from the same domain.\nMatch the level of specificity shown in the context labels.\nAvoid generic words such as \"object\", \"thing\", \"vehicle\", \"animal\", \"texture\" unless they are the most specific category possible\n\nAnswer concisely with one or two words.\n<images>Label: {}"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      keep_full_history: True
+      concatenate_labels: ", "
+      format: "interleaved"
+      # resize_images: 300  # max size, either width or height, keeping aspect ratio
+      #
+      # system_prompt: "You are a helpful assistant specialized in classifying the main object in images from various domains. Focus solely on the central subject—ignore backgrounds, settings, secondary elements, scenes, or unrelated details. Never include them. Output only a concise, comma-separated hierarchical list from broad to specific (e.g., \"general category, subcategory, specific type, key trait\"). Use exactly 3-6 unique terms—no more, no less. No repetitions, no duplicates, no synonyms. No prefixes like \"Classification:\" or any extra text."
+      # prompt: "You have examples of classifications from images in the same domain:\n{}\n\nThese represent the typical subjects and detail level in this domain. Now, classify this new image accordingly:"
+      # prompt: "Here are classifications of main objects from the same domain—use them to infer the typical style and specificity:\n{}\n\nClassify the main object in this new image in the same concise, focused style—only the central subject, no backgrounds or extras:"
+      #
+      # format: "bullet-list-captions"
+      include_image: True # Since step 0 and 1 do not put it into the context
+      exclude_rag_message: -1
+
+    #   resize_images: 308
+include: assets/_default_template_yaml

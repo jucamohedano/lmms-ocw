@@ -1,0 +1,81 @@
+task: "oxford_pets_tta_random_with_labels"
+
+doc_to_text: !function assets/_oxford_pets_utils.doc_to_text_multi_round
+output_type: generate_until_multi_round
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompts:
+      - "Classify the image."
+      - "Classify the TARGET image."
+      - "Classify the TARGET image."
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  resize_input_image: 224
+  rag:
+    0:
+      enabled: True
+      database_path: "" # no need for DB path, it's constructed dynamically # "oxford_pets/train/openai-clip-vit-base-patch32"
+      model_name: "openai/clip-vit-base-patch32"
+      system_prompt: "You are a precise image classifier. Classify the given image into **exactly one** of the categories below. Output **only the chosen category name**, nothing else. No explanation, no formatting, no quotes."
+      prompt: "<images>"
+      database_format: "dynamic_pt"
+      search_modality: "random"
+      grab_data_type: "image"
+      format: "no-text"
+      num_samples: 15
+      separate_queries: True
+      cache_and_reuse: False
+      include_input_separately: True # Include the image to be classified in the retrieved set, but only for its own query
+      include_target_classes: "pre-query"
+      target_classes_format: "csv-spaces"
+      target_classes_prompt: "Categories (choose exactly one):\n{}"
+
+    1:
+      enabled: True
+      pipe_from: -1
+      separate_queries: True
+      format: "all-image-answer-pairs"
+      system_prompt: "You are a precise image classifier. Classify the given image into **exactly one** of the categories below. Output **only the chosen category name**, nothing else. No explanation, no formatting, no quotes."
+      context_prompt: "Based on the context examples, you can update the label for the TARGET image by choosing it from the list of classes. If you think the label for the TARGET image is already correct, simply output it again.\nContext examples (from previous iteration):"
+      context_prompt_no_samples: "Choose only one label for the TARGET image from the list of classes provided."
+      prompt: "Label: {}\n"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      end_context_prompt_no_samples: "TARGET:"
+      prompt_for_sample: "Labels: {}\n"
+      keep_label_for_hot_image: True
+      keep_full_history: False
+      # concatenate_labels: ", "
+      clean_output_labels: True
+      circular: True
+      max_iters: 3
+      cache_and_reuse: False
+      gen_batch_size: 16 # Process one item at a time when generating, to avoid OOM
+      include_input: True # Include the image to be classified in the retrieved set
+      resize_images: 224
+      include_target_classes: "pre-query"
+      target_classes_format: "csv-spaces"
+      target_classes_prompt: "Categories (choose exactly one):\n{}"
+
+    2:
+      enabled: True
+      pipe_from: 1
+      system_prompt: "You are a precise image classifier. Classify the given image into **exactly one** of the categories below. Output **only the chosen category name**, nothing else. No explanation, no formatting, no quotes."
+      prompt: "Based on the examples, classify the TARGET image.\n<images>Label: {}"
+      end_context_prompt: "===== EXAMPLES END =====\nTARGET:"
+      keep_full_history: False
+      # concatenate_labels: ", "
+      format: "interleaved"
+      resize_images: 224 # max size, either width or height, keeping aspect ratio
+      include_image: True # Since step 0 and 1 do not put it into the context
+      store_memory: True
+      include_target_classes: "pre-query"
+      target_classes_format: "csv-spaces"
+      target_classes_prompt: "Categories (choose exactly one):\n{}"
+
+    #   resize_images: 308
+include: assets/_default_template_yaml

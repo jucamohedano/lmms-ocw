@@ -1,0 +1,46 @@
+task: "caltech101_multi_choice_post_variant"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    # 1
+    prompt: "Answer:"
+    # 2
+    # prompt: "Choose the top 3 categories that best describe the image."
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  resize_input_image: 224
+  rag:
+    enabled: True
+    database_path: cc12m/openai_ViT-B-32/index
+    model_name: openai/clip-vit-base-patch32
+    # 1
+    prompt: "What object is in the photo?\n{}"
+    # 2
+    # prompt: "Categories (choose exactly one):\n{}"
+    # 3
+    # prompt: "Categories:\n{}"
+    # 4
+    # prompt: "Categories (choose top 3):\n{}"
+    search_modality: "target-classes"
+    grab_data_type: "text"
+    format: "newlines"
+    position: "post-sample"
+include: assets/_default_template_yaml
+# Variants:
+# format               | resize input image | position    | prompt | perf
+# ---------------------|--------------------|-------------|--------|------
+# csv                  | None               | post-sample | 1 / 1  | 85.8
+# csv-spaces           | None               | post-sample | 1 / 1  | 87.9
+# bullet-list-captions | None               | post-sample | 1 / 1  | 91.6
+# csv-spaces           | 224                | post-sample | 1 / 1  | 88.5
+# bullet-list-captions | 224                | post-sample | 1 / 1  | 92.9
+# newlines             | 224                | post-sample | 1 / 1  | 91.8
+# csv-spaces           | 224                | pre-sample  | 1 / 1  | 81.4
+# bullet-list-captions | 224                | pre-sample  | 1 / 1  | 79.8
+# bullet-list-captions | 224                | post-sample | 1 / 2  | 94.6
+# bullet-list-captions | 224                | post-sample | 2 / 3  | 91.6
+# bullet-list-captions | 224                | post-sample | 1 / 4  | 88.5

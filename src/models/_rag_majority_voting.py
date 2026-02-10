@@ -139,6 +139,7 @@ class RAGMajorityVoting(Model):
             Path(db_root) / rag.get("database_path"),
             format=rag.get("database_format", "faiss"),
             model_name=rag.get("model_name"),
+            few_shot=rag.get("num_shots_per_class"),
         )
         log.info("Retrieval database loaded!")
 
@@ -351,5 +352,21 @@ class RAGMajorityVoting(Model):
 def rm_clip_vit_b32_openai(**model_kwargs) -> Model:
     """Load the CLIP ViT B/32 model from OpenAI."""
     model_name_or_path = "openai/clip-vit-base-patch32"
+    model = RAGMajorityVoting(model_name_or_path, **model_kwargs)
+    return model
+
+
+@register_model("rm-clip-vit-b16-openai")
+def rm_clip_vit_b16_openai(**model_kwargs) -> Model:
+    """Load the CLIP ViT B/16 model from OpenAI."""
+    model_name_or_path = "openai/clip-vit-base-patch16"
+    model = RAGMajorityVoting(model_name_or_path, **model_kwargs)
+    return model
+
+
+@register_model("rm-clip-vit-l14-openai")
+def rm_clip_vit_l14_openai(**model_kwargs) -> Model:
+    """Load the CLIP ViT L/14 model from OpenAI."""
+    model_name_or_path = "openai/clip-vit-large-patch14"
     model = RAGMajorityVoting(model_name_or_path, **model_kwargs)
     return model

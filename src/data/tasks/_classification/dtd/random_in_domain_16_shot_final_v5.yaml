@@ -1,0 +1,31 @@
+task: "dtd_random_in_domain_16_shot_final_v5"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "Based on the TARGET image and the class list, provide your answer.\nAnswer:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "dtd/train/openai-clip-vit-base-patch32"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "---\n**Optional Examples:**\nFor optional reference, here are a few **randomly selected** examples from the dataset. These examples **may or may not be relevant** to the TARGET image.\n<images>Answer: {}"
+
+    database_format: "pt"
+    search_modality: "random"
+    grab_data_type: "image"
+    format: "interleaved"
+    num_samples: 16
+    resize_images: 224
+    num_shots_per_class: 16
+    include_target_classes: "after-image"
+    target_classes_format: "bullet-list"
+    target_classes_prompt: "Classify the TARGET image. Choose exactly **one label** from the list:\n{}"
+    pre_image_prompt: "TARGET:"
+    position: "post-sample"
+  resize_input_image: 224
+include: assets/_default_template_yaml

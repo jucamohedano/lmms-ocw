@@ -10,13 +10,17 @@ from src.models._api import (
 )
 from src.models._base import Model
 from src.models._embedder_clip import EmbedderCLIP
+from src.models._embedder_gme import EmbedderGME
+from src.models._embedder_qwen2_vl import EmbedderQwen2VL
 from src.models._idefics2 import Idefics2
 from src.models._instructblip import InstructBLIP
 from src.models._internvl2 import InternVL2
 from src.models._llava_hf import LLaVA
 from src.models._llava_onevision import LLaVAOnevision
+from src.models._openai import OpenAIAPI
 from src.models._phi3v import Phi3v
 from src.models._qwen2_vl import Qwen2VL
+from src.models._qwen2_vl_cluster import Qwen2VLCluster
 from src.models._rag_majority_voting import RAGMajorityVoting
 
 __all__ = [
@@ -45,8 +49,12 @@ MODEL_TYPES: dict[str, Callable] = {
     "llava-onevision": LLaVAOnevision,
     "phi3v": Phi3v,
     "qwen2-vl": Qwen2VL,
+    "qwen2-vl-cluster": Qwen2VLCluster,
     "embedder-clip": EmbedderCLIP,
+    "embedder-gme": EmbedderGME,
+    "embedder-qwen2vl": EmbedderQwen2VL,
     "rag-majority-voting": RAGMajorityVoting,
+    "openai": OpenAIAPI,
 }
 
 

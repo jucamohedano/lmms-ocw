@@ -118,6 +118,7 @@ class Model(ABC):
                 load_in_8bit=load_in_8bit,
                 load_in_4bit=load_in_4bit,
                 bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_quant_type="nf4",
             )
 
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
@@ -271,11 +272,17 @@ class Model(ABC):
 
     def eval(self) -> None:
         """Set the module in evaluation mode."""
-        self.model.eval()
+        try:
+            self.model.eval()
+        except AttributeError:
+            return
 
     def train(self) -> None:
         """Set the module in training mode."""
-        self.model.train()
+        try:
+            self.model.train()
+        except AttributeError:
+            return
 
     @abstractmethod
     def load_model(self) -> None:

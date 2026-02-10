@@ -1,0 +1,29 @@
+task: "fgvc_aircraft_random_in_domain_4_shot_final"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "Answer:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  rag:
+    enabled: True
+    database_path: "fgvc_aircraft/train/openai-clip-vit-base-patch32"
+    model_name: "openai/clip-vit-base-patch32"
+    prompt: "Here are some examples of input-output pairs:\n<images>Answer: {}"
+
+    database_format: "pt"
+    search_modality: "random"
+    grab_data_type: "image"
+    format: "interleaved"
+    num_samples: 4
+    resize_images: 224
+    num_shots_per_class: 4
+    include_target_classes: "pre-query"
+    target_classes_format: "bullet-list"
+    target_classes_prompt: "What object is in the photo? Choose exactly one:\n{}"
+  resize_input_image: 224
+include: assets/_default_template_yaml

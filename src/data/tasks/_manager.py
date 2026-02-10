@@ -1035,6 +1035,7 @@ class ConfigurableTask(Task):
             # For multi-turn, the results are a list, and we take the last one.
             if self.OUTPUT_TYPE == "generate_until_multi_round":
                 result = [res[-1].strip() for res in results]
+                raw_results = [res.get(-1) for res in results]
             else:
                 result = [res.strip() for res in results]
 
@@ -1049,6 +1050,7 @@ class ConfigurableTask(Task):
             # and we select the last c.
             elif not self.multiple_target and isinstance(result, tuple):
                 result = result[-1]
+                raw_results = raw_results[-1]
 
             for metric in self._metric_fn_list:
                 if self.multiple_target and metric != "anls":

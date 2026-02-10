@@ -1,0 +1,32 @@
+task: "eurosat_streaming_similarity"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "Answer:"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 64
+  do_sample: False
+  resize_input_image: 224
+  rag:
+    enabled: True
+    database_path: ""
+    model_name: "openai/clip-vit-base-patch32"
+    database_format: "dynamic_pt"
+    search_modality: "in-domain-rag"
+    grab_data_type: "image"
+    format: "interleaved"
+    num_samples: 16
+    resize_images: 224
+    store_memory: True
+
+    pre_image_prompt: "===== EXAMPLES END =====\nTARGET:"
+    prompt: "Here are some examples of input-output pairs:\n<images>Answer: {}"
+
+    include_target_classes: "pre-query"
+    target_classes_format: "bullet-list"
+    target_classes_prompt: "Classify the TARGET image. Choose exactly one label from the list:\n{}"
+
+include: assets/_default_template_yaml

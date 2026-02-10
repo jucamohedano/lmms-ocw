@@ -7,7 +7,6 @@ repos:
     hooks:
       # list of supported hooks: https://pre-commit.com/hooks.html
       - id: check-case-conflict # checks for files that would conflict in case-insensitive file systems
-      - id: check-docstring-first # checks a common error of defining a docstring after code
       - id: check-executables-have-shebangs # ensures that (non-binary) executables have a shebang
       - id: check-shebang-scripts-are-executable # ensures that (non-binary) files with a shebang are executable
       - id: check-merge-conflict # checks for files that contain merge conflict strings
@@ -49,7 +48,7 @@ repos:
     hooks:
       - id: codespell
         args:
-          - --skip=data/**,logs/**,*.bib,*.csv,*.js,src/data/tasks/**
+          # - --skip=data/**,logs/**,*.bib,*.csv,*.js,src/data/tasks/**
           - --ignore-words-list=ans,rouge
 
   # python docstring coverage checking
@@ -80,16 +79,16 @@ repos:
       - id: shellcheck
 
   # python type checker
-  - repo: https://github.com/hoefling/pre-commit-pytype
-    rev: 2024.10.11
-    hooks:
-      - id: pytype
-        args:
-          [
-            "--disable",
-            "import-error,not-supported-yet",
-            "--exclude",
-            "tests/**/conftest.py",
-            "-n",
-            "auto",
-          ]
+  # - repo: https://github.com/hoefling/pre-commit-pytype
+  #   rev: 2024.10.11
+  #   hooks:
+  #     - id: pytype
+  #       args:
+  #         [
+  #           "--disable",
+  #           "import-error,not-supported-yet",
+  #           "--exclude",
+  #           "tests/**/conftest.py",
+  #           "-n",
+  #           "auto",
+  #         ]

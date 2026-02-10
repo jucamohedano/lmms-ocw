@@ -10,12 +10,23 @@ output_type: generate_until
 test_split: test
 
 metric_list:
+  - metric: loglikelihood
+    aggregation: mean
+    higher_is_better: true
+    raw_results: true
+  - metric: perplexity
+    aggregation: mean
+    higher_is_better: false
+    raw_results: true
   - metric: context_length
     aggregation: mean
     higher_is_better: true
     raw_results: true
   - metric: concept_semantic_similarity
     aggregation: concept_semantic_similarity
+    higher_is_better: true
+  - metric: median_concept_semantic_similarity
+    aggregation: concept_semantic_similarity@median
     higher_is_better: true
   - metric: exact_match
     aggregation: mean
