@@ -13,7 +13,7 @@ from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_i
 from llava.model.builder import load_pretrained_model
 from packaging import version
 from PIL import Image
-from transformers.modeling_outputs import GenerateOutput
+from transformers.utils import ModelOutput
 
 from src import utils
 from src.data.tasks import TaskInstance, TaskSingleOutput
@@ -379,7 +379,7 @@ class LLaVAOnevision(Model):
         return res
 
     def _loglikelihood(
-        self, input_ids: dict, generation_output: GenerateOutput
+        self, input_ids: dict, generation_output: ModelOutput
     ) -> dict[str, torch.Tensor | list]:
         """Compute log-likelihood and related metrics for generated sequences.
 
@@ -994,12 +994,12 @@ class LLaVAOnevision(Model):
             "image_sizes": gen_kwargs["image_sizes"],
         }, generation_output
 
-    def _decode(self, generation_output: GenerateOutput) -> list[str]:
+    def _decode(self, generation_output: ModelOutput) -> list[str]:
         """Decode the generated output into a list of strings.
 
         Args:
         ----
-            generation_output (GenerateOutput): The output from the model generation.
+            generation_output (ModelOutput): The output from the model generation.
 
         """
         text_outputs = self.tokenizer.batch_decode(

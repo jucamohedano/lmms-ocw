@@ -11,7 +11,7 @@ import torch
 from PIL import Image
 from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
-from transformers.modeling_outputs import GenerateOutput
+from transformers.utils import ModelOutput
 
 from src import utils
 from src.data.tasks import TaskInstance, TaskSingleOutput
@@ -183,7 +183,7 @@ class Qwen2VL(Model):
         raise NotImplementedError
 
     def _loglikelihood(
-        self, inputs: dict, generation_output: GenerateOutput
+        self, inputs: dict, generation_output: ModelOutput
     ) -> dict[str, torch.Tensor | list]:
         """Compute log-likelihood and related metrics for generated sequences.
 
@@ -662,9 +662,7 @@ class Qwen2VL(Model):
 
         return messages, images_per_request
 
-    def _generate(
-        self, messages: list, gen_kwargs: dict, rag: dict
-    ) -> tuple[dict, GenerateOutput]:
+    def _generate(self, messages: list, gen_kwargs: dict, rag: dict) -> tuple[dict, ModelOutput]:
         """Generate model outputs for the given messages.
 
         Args:
@@ -724,13 +722,13 @@ class Qwen2VL(Model):
 
         return inputs, generation_output
 
-    def _decode(self, inputs: dict, generation_output: GenerateOutput) -> list[str]:
+    def _decode(self, inputs: dict, generation_output: ModelOutput) -> list[str]:
         """Decode the generated output into a list of strings.
 
         Args:
         ----
             inputs (dict): The input dictionary containing input IDs.
-            generation_output (GenerateOutput): The output from the model generation.
+            generation_output (ModelOutput): The output from the model generation.
 
         """
         cont = generation_output.sequences
