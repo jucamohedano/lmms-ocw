@@ -30,7 +30,7 @@ repos:
 
   # python security linter
   - repo: https://github.com/PyCQA/bandit
-    rev: "1.7.5"
+    rev: "1.8.0"
     hooks:
       - id: bandit
         args: ["-s", "B101,B301,B403,B404,B603", "-c", "pyproject.toml"]
