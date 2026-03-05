@@ -50,6 +50,25 @@ GROUP_METRICS = [
 log = utils.get_logger(__name__, rank_zero_only=True)
 
 
+def _stack_column_as_tensor(column: torch.Tensor | Iterable) -> torch.Tensor:
+    """Convert a datasets column/list into a stacked torch tensor."""
+    if isinstance(column, torch.Tensor):
+        return column
+
+    rows = list(column)
+    if len(rows) == 0:
+        return torch.empty((0, 0), dtype=torch.float32)
+
+    tensor_rows = []
+    for row in rows:
+        if isinstance(row, torch.Tensor):
+            tensor_rows.append(row.detach().cpu())
+        else:
+            tensor_rows.append(torch.as_tensor(row))
+
+    return torch.stack(tensor_rows, dim=0)
+
+
 def _weighted_mean(items: list) -> float:
     """Calculate the weighted mean of a list of documents.
 
@@ -299,8 +318,8 @@ def concept_semantic_similarity(
     )
 
     # Get the semantic similarities
-    refs_z = pairs_data["reference_sentence_bert_embeds"].unsqueeze(1)
-    concepts_z = pairs_data["concept_sentence_bert_embeds"].unsqueeze(2)
+    refs_z = _stack_column_as_tensor(pairs_data["reference_sentence_bert_embeds"]).unsqueeze(1)
+    concepts_z = _stack_column_as_tensor(pairs_data["concept_sentence_bert_embeds"]).unsqueeze(2)
     similarities = torch.bmm(refs_z, concepts_z).squeeze()
 
     # Get the similarities for each of the unique pairs.
@@ -316,18 +335,18 @@ def concept_semantic_similarity(
 
     if reduce == "max":
         data = data.map(lambda x: {"max_concept_similarity": x["concepts_similarities"].max()})
-        return torch.mean(data["max_concept_similarity"]).item()
+        return torch.mean(_stack_column_as_tensor(data["max_concept_similarity"])).item()
     elif reduce == "mean":
         data = data.map(lambda x: {"mean_concept_similarity": x["concepts_similarities"].mean()})
-        return torch.mean(data["mean_concept_similarity"]).item()
+        return torch.mean(_stack_column_as_tensor(data["mean_concept_similarity"])).item()
     elif reduce == "median":
         data = data.map(
             lambda x: {"median_concept_similarity": x["concepts_similarities"].median()}
         )
-        return torch.mean(data["median_concept_similarity"]).item()
+        return torch.mean(_stack_column_as_tensor(data["median_concept_similarity"])).item()
     elif reduce == "min":
         data = data.map(lambda x: {"min_concept_similarity": x["concepts_similarities"].min()})
-        return torch.mean(data["min_concept_similarity"]).item()
+        return torch.mean(_stack_column_as_tensor(data["min_concept_similarity"])).item()
 
     # Return without reduction
     concepts = data["prediction_concepts"]
@@ -496,8 +515,8 @@ def simplified_concept_semantic_similarity(
     )
 
     # Get the semantic similarities
-    refs_z = pairs_data["reference_sentence_bert_embeds"].unsqueeze(1)
-    concepts_z = pairs_data["concept_sentence_bert_embeds"].unsqueeze(2)
+    refs_z = _stack_column_as_tensor(pairs_data["reference_sentence_bert_embeds"]).unsqueeze(1)
+    concepts_z = _stack_column_as_tensor(pairs_data["concept_sentence_bert_embeds"]).unsqueeze(2)
     similarities = torch.bmm(refs_z, concepts_z).squeeze()
 
     # Get the similarities for each of the unique pairs.
@@ -513,18 +532,18 @@ def simplified_concept_semantic_similarity(
 
     if reduce == "max":
         data = data.map(lambda x: {"max_concept_similarity": x["concepts_similarities"].max()})
-        return torch.mean(data["max_concept_similarity"]).item()
+        return torch.mean(_stack_column_as_tensor(data["max_concept_similarity"])).item()
     elif reduce == "mean":
         data = data.map(lambda x: {"mean_concept_similarity": x["concepts_similarities"].mean()})
-        return torch.mean(data["mean_concept_similarity"]).item()
+        return torch.mean(_stack_column_as_tensor(data["mean_concept_similarity"])).item()
     elif reduce == "median":
         data = data.map(
             lambda x: {"median_concept_similarity": x["concepts_similarities"].median()}
         )
-        return torch.mean(data["median_concept_similarity"]).item()
+        return torch.mean(_stack_column_as_tensor(data["median_concept_similarity"])).item()
     elif reduce == "min":
         data = data.map(lambda x: {"min_concept_similarity": x["concepts_similarities"].min()})
-        return torch.mean(data["min_concept_similarity"]).item()
+        return torch.mean(_stack_column_as_tensor(data["min_concept_similarity"])).item()
 
     # Return without reduction
     concepts = data["prediction_concepts"]
@@ -636,8 +655,8 @@ def mean_average_semantic_similarity(
         fn_kwargs={"input_column": "prediction"},
     )
 
-    refs_z = data["reference_sentence_bert_embeds"].unsqueeze(1)
-    preds_z = data["prediction_sentence_bert_embeds"].unsqueeze(2)
+    refs_z = _stack_column_as_tensor(data["reference_sentence_bert_embeds"]).unsqueeze(1)
+    preds_z = _stack_column_as_tensor(data["prediction_sentence_bert_embeds"]).unsqueeze(2)
 
     if reduce == "mean":
         outputs = {}
@@ -732,8 +751,8 @@ def semantic_similarity(
         fn_kwargs={"input_column": "prediction"},
     )
 
-    refs_z = data["reference_sentence_bert_embeds"].unsqueeze(1)
-    preds_z = data["prediction_sentence_bert_embeds"].unsqueeze(2)
+    refs_z = _stack_column_as_tensor(data["reference_sentence_bert_embeds"]).unsqueeze(1)
+    preds_z = _stack_column_as_tensor(data["prediction_sentence_bert_embeds"]).unsqueeze(2)
 
     if reduce == "mean":
         return torch.bmm(refs_z, preds_z).squeeze().mean().item()
