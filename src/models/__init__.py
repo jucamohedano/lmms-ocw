@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable
 
 from src.models._api import (
@@ -16,16 +17,27 @@ from src.models._idefics2 import Idefics2
 from src.models._instructblip import InstructBLIP
 from src.models._internvl2 import InternVL2
 from src.models._llava_hf import LLaVA
-from src.models._llava_onevision import LLaVAOnevision
+
+try:
+    from src.models._llava_onevision import LLaVAOnevision
+except ImportError:
+    LLaVAOnevision = None
+    logging.getLogger(__name__).warning(
+        "Could not import LLaVAOnevision (likely a transformers version mismatch). "
+        "LLaVA-OneVision models will not be available."
+    )
+
 from src.models._openai import OpenAIAPI
 from src.models._phi3v import Phi3v
 from src.models._qwen2_vl import Qwen2VL
 from src.models._qwen2_vl_cluster import Qwen2VLCluster
 from src.models._rag_majority_voting import RAGMajorityVoting
+from src.models._ttw_wrapper import TTWModel
 
 __all__ = [
     "MODELS",
     "Model",
+    "TTWModel",
     "Idefics2",
     "InstructBLIP",
     "InternVL2",
@@ -38,7 +50,6 @@ __all__ = [
     "get_model_builder",
     "get_model_info",
     "get_models_info",
-    "register_model",
 ]
 
 MODEL_TYPES: dict[str, Callable] = {
@@ -46,7 +57,6 @@ MODEL_TYPES: dict[str, Callable] = {
     "instructblip": InstructBLIP,
     "internvl2": InternVL2,
     "llava": LLaVA,
-    "llava-onevision": LLaVAOnevision,
     "phi3v": Phi3v,
     "qwen2-vl": Qwen2VL,
     "qwen2-vl-cluster": Qwen2VLCluster,
@@ -56,6 +66,9 @@ MODEL_TYPES: dict[str, Callable] = {
     "rag-majority-voting": RAGMajorityVoting,
     "openai": OpenAIAPI,
 }
+
+if LLaVAOnevision is not None:
+    MODEL_TYPES["llava-onevision"] = LLaVAOnevision
 
 
 @register_model("custom-model")

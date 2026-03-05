@@ -76,6 +76,8 @@ class Qwen2VL(Model):
         dtype: str | torch.dtype = "bfloat16",
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
+        compile: bool = True,
+        lora_backend: str = "peft",
         **kwargs,
     ) -> None:
         self._model_name_or_path = model_name_or_path
@@ -84,6 +86,8 @@ class Qwen2VL(Model):
         self._max_pixels = max_pixels
         self._min_pixels = min_pixels
         self.batch_size_per_gpu = batch_size
+        self._compile = compile
+        self._lora_backend = str(lora_backend).lower()
 
         if device_map == "None":
             device_map = None
@@ -98,8 +102,45 @@ class Qwen2VL(Model):
             **kwargs,
         )
 
+        log.info("Flash attention 2: %s", self._use_flash_attention_2)
+
     def load_model(self) -> None:
         """Load the model in memory."""
+        if self._lora_backend == "unsloth":
+            import os
+
+            from unsloth import FastVisionModel
+
+            # Keep a dedicated Unsloth loading path instead of translating an
+            # already-loaded HF model into Unsloth expectations.
+            model_ref = self._model_name_or_path
+            if "/" in model_ref and not os.path.exists(model_ref):
+                try:
+                    from huggingface_hub import snapshot_download
+
+                    model_ref = snapshot_download(
+                        repo_id=self._model_name_or_path,
+                        local_files_only=True,
+                    )
+                    log.info("Resolved offline HF snapshot for Unsloth: %s", model_ref)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Unsloth backend requires a locally cached model snapshot. "
+                        f"Could not resolve '{self._model_name_or_path}' from local HF cache."
+                    ) from exc
+
+            self._model, self._processor = FastVisionModel.from_pretrained(
+                model_name=model_ref,
+                max_seq_length=2048,
+                dtype=None,
+                load_in_4bit=self._load_in_4bit,
+            )
+            # Unsloth returns a processor; keep tokenizer API compatibility
+            # expected by generate_until (e.g., tokenizer.encode).
+            self._tokenizer = getattr(self._processor, "tokenizer", self._processor)
+            log.info("Loaded model with Unsloth backend.")
+            return
+
         model_kwargs = {
             "torch_dtype": self.dtype,
             "device_map": self.device_map,
@@ -127,7 +168,8 @@ class Qwen2VL(Model):
             PretrainedModel = Qwen2_5_VLForConditionalGeneration
 
         self._model = PretrainedModel.from_pretrained(self._model_name_or_path, **model_kwargs)
-        self._model = torch.compile(self._model, mode="max-autotune", fullgraph=True)
+        if self._compile:
+            self._model = torch.compile(self._model, mode="max-autotune", fullgraph=True)
         self._processor = AutoProcessor.from_pretrained(
             self._model_name_or_path, **processor_kwargs
         )
@@ -1879,6 +1921,133 @@ class Qwen2VL(Model):
         pbar.close()
         return res
 
+    # ------------------------------------------------------------------
+    # TTW interface — model-specific formatting for Test-Time Warmup
+    # ------------------------------------------------------------------
+
+    def ttw_generate_captions(
+        self,
+        image: Image.Image,
+        prompts: list[str],
+        num_candidates: int,
+        temperature: float,
+        max_new_tokens: int,
+        batch_size: int = 1,
+    ) -> list[tuple[str, list[str]]]:
+        """Generate caption candidates for each prompt using this model's chat format.
+
+        Args:
+        ----
+            image: The input image.
+            prompts: List of auxiliary prompts to generate captions for.
+            num_candidates: Number of candidate captions per prompt.
+            temperature: Sampling temperature for generation.
+            max_new_tokens: Maximum new tokens to generate.
+            batch_size: Used for batching during internal token generation.
+
+        Returns:
+        -------
+            List of (prompt, [candidate_captions]) tuples.
+
+        """
+        results_map = {prompt: [] for prompt in prompts}
+
+        # Pre-compute formatted text for each unique prompt (avoids redundant
+        # ttw_format_chat + apply_chat_template calls across candidates)
+        formatted_texts = {}
+        for prompt in prompts:
+            msg = self.ttw_format_chat(image, prompt)
+            formatted_texts[prompt] = self.processor.apply_chat_template(
+                msg, tokenize=False, add_generation_prompt=True
+            )
+
+        # Flatten all (prompt, candidate_idx) pairs into a single list so we can
+        # chunk them into GPU-friendly batches. Total items = num_prompts * num_candidates.
+        # e.g. 10 prompts x 10 candidates = 100 flat requests.
+        flat_requests = [p for p in prompts for _ in range(num_candidates)]
+
+        # Process flat_requests in chunks of `batch_size`. Each chunk is tokenized
+        # into a single padded tensor and fed to model.generate() in one GPU call,
+        # producing `batch_size` captions simultaneously instead of sequentially.
+        for i in range(0, len(flat_requests), batch_size):
+            batch_prompts = flat_requests[i : i + batch_size]
+            batch_texts = [formatted_texts[p] for p in batch_prompts]
+
+            # Tokenize the entire batch into a single padded tensor.
+            # The same image is replicated for each item in the batch since
+            # all candidates share the same input image.
+            inputs = self.processor(
+                text=batch_texts,
+                images=[image] * len(batch_texts),
+                return_tensors="pt",
+                padding=True,
+            ).to("cuda")
+
+            # Single batched forward pass — generates all candidates in parallel
+            with torch.no_grad():
+                out = self.model.generate(
+                    **inputs,
+                    do_sample=True,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                )
+
+            # Decode generated tokens (strip input prefix) back to strings
+            batch_captions = self.processor.batch_decode(
+                out[:, inputs.input_ids.shape[1] :], skip_special_tokens=True
+            )
+
+            # Map each decoded caption back to its originating prompt
+            for prompt, caption in zip(batch_prompts, batch_captions, strict=True):
+                results_map[prompt].append(caption)
+
+        return [(prompt, results_map[prompt]) for prompt in prompts]
+
+    def ttw_format_chat(
+        self,
+        image: Image.Image,
+        prompt: str,
+        caption: str | None = None,
+    ) -> list[dict]:
+        """Format a TTW chat message for this model's chat template.
+
+        Args:
+        ----
+            image: The input image.
+            prompt: The user prompt.
+            caption: Optional assistant caption. If provided, appends an assistant turn.
+
+        Returns:
+        -------
+            List of message dicts ready for `apply_chat_template`.
+
+        """
+        msg = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        if caption is not None:
+            msg.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": caption},
+                    ],
+                }
+            )
+        return msg
+
+    def ttw_get_vision_encoder(self) -> list[torch.nn.Module]:
+        """Return the vision encoder modules to be frozen."""
+        # We explicitly return the patch embed and the vision blocks,
+        # but we DO NOT return self.model.visual.merger (the connector)!
+        return [self.model.visual.patch_embed, self.model.visual.blocks]
+
 
 @register_model("qwen2-vl-7b")
 def qwen2_vl_7b(**model_kwargs) -> Model:
@@ -1918,3 +2087,81 @@ def qwen2_vl_mmrait(**model_kwargs) -> Model:
     model_name_or_path = "whalezzz/MM-RAIT-Qwen2-VL"
     model = Qwen2VL(model_name_or_path, **model_kwargs)
     return model
+
+
+from src.models._ttw_wrapper import TTWModel  # noqa: E402, I001
+
+
+@register_model("qwen2-vl-2b-ttw")
+def qwen2_vl_2b_ttw(**model_kwargs) -> Model:
+    """Load Qwen2VL-2B with Test-Time Warmup."""
+    model_name_or_path = "Qwen/Qwen2-VL-2B-Instruct"
+    offline_caption_dir = model_kwargs.pop("offline_caption_dir", None)
+    ttw_lr = model_kwargs.pop("ttw_lr", 1e-6)
+    ttw_epochs = model_kwargs.pop("ttw_epochs", 2)
+    ttw_batch_size = model_kwargs.pop("ttw_batch_size", 5)
+    ttw_num_candidates = model_kwargs.pop("ttw_num_candidates", 10)
+    ttw_caption_temperature = model_kwargs.pop("ttw_caption_temperature", 0.75)
+    ttw_max_new_tokens = model_kwargs.pop("ttw_max_new_tokens", 128)
+    clip_model_name = model_kwargs.pop("clip_model_name", None)
+    ttw_finetune_method = model_kwargs.pop("ttw_finetune_method", "full")
+    ttw_lora_backend = model_kwargs.pop("ttw_lora_backend", "peft")
+    ttw_svf_rank = model_kwargs.pop("ttw_svf_rank", -1)
+    base = Qwen2VL(
+        model_name_or_path,
+        compile=False,
+        lora_backend=ttw_lora_backend,
+        **model_kwargs,
+    )
+    return TTWModel(
+        base,
+        ttw_lr=ttw_lr,
+        ttw_epochs=ttw_epochs,
+        ttw_batch_size=ttw_batch_size,
+        ttw_num_candidates=ttw_num_candidates,
+        ttw_caption_temperature=ttw_caption_temperature,
+        ttw_max_new_tokens=ttw_max_new_tokens,
+        clip_model_name=clip_model_name,
+        offline_caption_dir=offline_caption_dir,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+    )
+
+
+@register_model("qwen2-vl-7b-ttw")
+def qwen2_vl_7b_ttw(**model_kwargs) -> Model:
+    """Load Qwen2VL-7B with Test-Time Warmup."""
+    model_name_or_path = "Qwen/Qwen2-VL-7B-Instruct"
+    offline_caption_dir = model_kwargs.pop("offline_caption_dir", None)
+    ttw_lr = model_kwargs.pop("ttw_lr", 1e-6)
+    ttw_epochs = model_kwargs.pop("ttw_epochs", 2)
+    ttw_batch_size = model_kwargs.pop("ttw_batch_size", 5)
+    ttw_num_candidates = model_kwargs.pop("ttw_num_candidates", 10)
+    ttw_caption_temperature = model_kwargs.pop("ttw_caption_temperature", 0.75)
+    ttw_max_new_tokens = model_kwargs.pop("ttw_max_new_tokens", 128)
+    clip_model_name = model_kwargs.pop("clip_model_name", None)
+    ttw_finetune_method = model_kwargs.pop("ttw_finetune_method", "full")
+    ttw_lora_backend = model_kwargs.pop("ttw_lora_backend", "peft")
+    ttw_svf_rank = model_kwargs.pop("ttw_svf_rank", -1)
+    ttw_compile = model_kwargs.pop("ttw_compile", False)
+    base = Qwen2VL(
+        model_name_or_path,
+        compile=ttw_compile,
+        lora_backend=ttw_lora_backend,
+        **model_kwargs,
+    )
+    return TTWModel(
+        base,
+        ttw_lr=ttw_lr,
+        ttw_epochs=ttw_epochs,
+        ttw_batch_size=ttw_batch_size,
+        ttw_num_candidates=ttw_num_candidates,
+        ttw_caption_temperature=ttw_caption_temperature,
+        ttw_max_new_tokens=ttw_max_new_tokens,
+        clip_model_name=clip_model_name,
+        offline_caption_dir=offline_caption_dir,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+    )

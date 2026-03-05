@@ -222,6 +222,11 @@ def _run_single_evaluation(args: argparse.Namespace) -> tuple[dict, dict] | tupl
 
     datetime_str = args.datetime_str
 
+    if getattr(args, "ttw_offline_generate", False):
+        from src.utils.ttw_offline import generate_offline_captions
+
+        return generate_offline_captions(args, task_manager, task_names)
+
     results = simple_evaluate(
         model_name=args.model,
         model_args=args.model_args,
@@ -300,7 +305,10 @@ def main(args: argparse.Namespace) -> None:
             args.wandb_args += f",name={name}"
         wandb_logger = WandbLogger(**utils.parse_string_args(args.wandb_args))
 
-    # Reset logger
+    # Set logging level from CLI argument
+    eval_logger_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(level=eval_logger_level)
+    log.setLevel(eval_logger_level)
     log.info("Log level set to %s", args.log_level)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -582,6 +590,46 @@ if __name__ == "__main__":
         "--process_with_media",
         action="store_true",
         help="Whether you will process you dataset with audio, image.",
+    )
+    parser.add_argument(
+        "--ttw_offline_generate",
+        action="store_true",
+        help="If set, skips evaluation and generates TTW caption datasets offline.",
+    )
+    parser.add_argument(
+        "--ttw_use_vllm",
+        action="store_true",
+        help="If set, uses vLLM instead of HuggingFace for faster offline caption generation.",
+    )
+    parser.add_argument(
+        "--ttw_offline_num_candidates",
+        type=int,
+        default=10,
+        help="Number of candidates per prompt for offline generation.",
+    )
+    parser.add_argument(
+        "--ttw_offline_temperature",
+        type=float,
+        default=0.75,
+        help="Temperature for generative candidates.",
+    )
+    parser.add_argument(
+        "--ttw_offline_max_new_tokens",
+        type=int,
+        default=128,
+        help="Max new tokens for generative candidates.",
+    )
+    parser.add_argument(
+        "--ttw_offline_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for generating candidates offline.",
+    )
+    parser.add_argument(
+        "--ttw_offline_limit",
+        type=int,
+        default=None,
+        help="Limit offline captions. Separate from --limit for standard eval.",
     )
     args = parser.parse_args()
 
