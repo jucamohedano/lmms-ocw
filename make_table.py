@@ -128,9 +128,11 @@ def load_results(experiment_name: str, model: str | None, exclude: str | None):
 
         if "perplexity,none" in experiment["results"][experiment_name]:
             perplexity = experiment["results"][experiment_name]["perplexity,none"]
+        elif "avg_perplexity,none" in experiment["results"][experiment_name]:
+            perplexity = experiment["results"][experiment_name]["avg_perplexity,none"]
         else:
             # Compute average perplexity
-            perplexity = [x.get("perplexity", 0) for x in samples]
+            perplexity = [x.get("perplexity", x.get("avg_perplexity", 0)) for x in samples]
             perplexity = sum(perplexity) / len(perplexity)
 
         # Store results
