@@ -122,7 +122,9 @@ class Model(ABC):
             )
 
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
-        self.accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
+        self.accelerator = Accelerator(
+            kwargs_handlers=[accelerator_kwargs],
+        )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if self.accelerator.num_processes > 1:
@@ -176,8 +178,12 @@ class Model(ABC):
                 log.info("Using %d devices with data parallelism", self.accelerator.num_processes)
             self._rank = self.accelerator.process_index
             self._world_size = self.accelerator.num_processes
-        elif self.accelerator.num_processes == 1 and self.device_map == "auto":
-            log.info("Using %d devices with pipeline parallelism", self.accelerator.num_processes)
+        elif self.accelerator.num_processes == 1 and self.device_map in ("auto", "balanced"):
+            log.info(
+                "Using %d process(es) with device_map=%s",
+                self.accelerator.num_processes,
+                self.device_map,
+            )
             self._rank = 0
             self._world_size = 1
         else:

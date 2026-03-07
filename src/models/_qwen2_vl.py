@@ -134,6 +134,7 @@ class Qwen2VL(Model):
                 max_seq_length=2048,
                 dtype=None,
                 load_in_4bit=self._load_in_4bit,
+                device_map=self.device_map,
             )
             # Unsloth returns a processor; keep tokenizer API compatibility
             # expected by generate_until (e.g., tokenizer.encode).

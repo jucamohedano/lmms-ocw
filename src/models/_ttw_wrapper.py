@@ -39,6 +39,24 @@ TTW_AUXILIARY_PROMPTS = [
 ]
 
 
+def _log_gpu_memory(label: str) -> None:
+    """Log per-GPU memory for debugging OOM issues."""
+    if not torch.cuda.is_available():
+        return
+    for i in range(torch.cuda.device_count()):
+        alloc = torch.cuda.memory_allocated(i) / (1024**3)
+        reserved = torch.cuda.memory_reserved(i) / (1024**3)
+        total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+        log.info(
+            "[GPU %d] %s: %.2f/%.2f GiB allocated (%.2f GiB reserved)",
+            i,
+            label,
+            alloc,
+            total,
+            reserved,
+        )
+
+
 class TTWModel:
     """Wraps any Model to add Test-Time Warmup"""
 
@@ -190,6 +208,8 @@ class TTWModel:
 
     def _unfreeze_connector(self, model) -> None:
         """Unfreeze the vision-language connector (guaranteed in our multimodal setups)."""
+        if hasattr(model, "module"):
+            model = model.module
         connector_owner = model
         if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
             # PEFT-wrapped path
@@ -265,7 +285,7 @@ class TTWModel:
 
     def _ttw_warmup(self, image: Image.Image, task_name: str = None, doc_id: int = None):
         """Run TTW warmup: fetch or generate captions, train on best."""
-        model = self._base.model
+        model = getattr(self._base, "_model", self._base.model)  # use prepared model for DDP
 
         log.info("Starting TTW Warmup for new image...")
 
@@ -314,6 +334,7 @@ class TTWModel:
                 log.debug(f"Prompt: {prompt}\n  Best Caption: {best}")
 
         # 2. Freeze/unfreeze based on finetuning method
+        _log_gpu_memory("TTW warmup: before freeze/unfreeze")
         if self.ttw_finetune_method == "svf":
             # SVF layers were replaced at init. Freeze everything, then unfreeze
             # only the S vectors and the connector (state_dict restore in generate_until resets requires_grad).
@@ -352,35 +373,92 @@ class TTWModel:
                     param.requires_grad = False
             trainable_params = [p for p in model.parameters() if p.requires_grad]
 
-        # 3. Warmup training
-        # torch.enable_grad() overrides the engine's torch.set_grad_enabled(False)
+        trainable_numel = sum(p.numel() for p in trainable_params)
+        trainable_gib = sum(p.numel() * p.element_size() for p in trainable_params) / (1024**3)
         log.info(
-            f"Starting TTW warmup training "
-            f"(method={self.ttw_finetune_method}, epochs={self.ttw_epochs}, lr={self.ttw_lr})..."
+            "TTW trainable: %s params (%.2f GiB weights, ~%.2f GiB opt+grad)",
+            f"{trainable_numel:,}",
+            trainable_gib,
+            3 * trainable_gib,
         )
-        optimizer = AdamW(trainable_params, lr=self.ttw_lr)
+
+        # 3. Warmup training – simple loop matching the original TTW repo.
+        # With DDP each replica trains on the same captions (correct for
+        # per-image adaptation). No Accelerate accumulate() needed.
+        if self.ttw_finetune_method == "full":
+            try:
+                import bitsandbytes as bnb
+
+                optimizer = bnb.optim.AdamW8bit(trainable_params, lr=self.ttw_lr)
+                log.info("TTW: using 8-bit AdamW (bitsandbytes)")
+            except ImportError:
+                log.warning("bitsandbytes not installed, falling back to regular AdamW")
+                optimizer = AdamW(trainable_params, lr=self.ttw_lr, foreach=False)
+        else:
+            optimizer = AdamW(trainable_params, lr=self.ttw_lr, foreach=False)
+
+        log.info(
+            "TTW warmup: method=%s epochs=%d lr=%s batch_size=%d",
+            self.ttw_finetune_method,
+            self.ttw_epochs,
+            self.ttw_lr,
+            self.ttw_batch_size,
+        )
         model_dtype = getattr(self._base.model, "dtype", torch.bfloat16)
+
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+            log.info("TTW: gradient checkpointing enabled")
+
         model.train()
+        _log_gpu_memory("TTW warmup: before training loop")
+
+        # Full FT uses gradient accumulation (micro-batch size 1) to avoid OOM
+        # with ~7.6B trainable params. LoRA/SVF have small trainable param counts
+        # so they can forward the full batch at once for speed.
+        use_grad_accum = self.ttw_finetune_method == "full"
+
         with torch.enable_grad(), torch.autocast("cuda", dtype=model_dtype):
             for epoch in range(self.ttw_epochs):
                 for start in range(0, len(warmup_captions), self.ttw_batch_size):
-                    chunk = warmup_captions[start : start + self.ttw_batch_size]
-                    batch = self._ttw_build_training_batch(image, chunk)
-                    outputs = model(**batch)
-                    loss = outputs.loss
-                    log.debug(
-                        f"TTW Epoch {epoch+1}/{self.ttw_epochs} "
-                        f"step {start // self.ttw_batch_size + 1}: loss = {loss.item():.4f}"
-                    )
-                    loss.backward()
+                    batch_captions = warmup_captions[start : start + self.ttw_batch_size]
+                    step_loss = 0.0
+                    if use_grad_accum:
+                        for caption_pair in batch_captions:
+                            micro_batch = self._ttw_build_training_batch(image, [caption_pair])
+                            outputs = model(**micro_batch)
+                            loss = outputs.loss
+                            loss.backward()
+                            step_loss += loss.detach().item()
+                    else:
+                        batch_inputs = self._ttw_build_training_batch(image, batch_captions)
+                        outputs = model(**batch_inputs)
+                        loss = outputs.loss
+                        loss.backward()
+                        step_loss = loss.detach().item()
                     optimizer.step()
-                    optimizer.zero_grad()
-        model.eval()
+                    optimizer.zero_grad(set_to_none=True)
+                    log.debug(
+                        "TTW epoch %d/%d step %d loss=%.4f",
+                        epoch + 1,
+                        self.ttw_epochs,
+                        start // self.ttw_batch_size + 1,
+                        step_loss,
+                    )
+                    torch.cuda.empty_cache()
+                if epoch == 0:
+                    _log_gpu_memory("TTW warmup: after epoch 1")
 
-        # Re-freeze all params for inference
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+
+        model.eval()
+        del optimizer, trainable_params
+        torch.cuda.empty_cache()
         for param in model.parameters():
             param.requires_grad = False
-        log.info("TTW Warmup finished. Model restored to eval mode and fully frozen.")
+        _log_gpu_memory("TTW warmup: done")
+        log.info("TTW warmup finished.")
 
     def _ttw_build_training_batch(self, image, warmup_captions):
         """Build a training batch from (prompt, caption) pairs with proper label masking.
@@ -507,7 +585,9 @@ class TTWModel:
         Images are extracted via the doc_to_visual mechanism in TaskInstance.args:
         args = (context, gen_kwargs, doc_to_visual_fn, doc_id, task, split)
         """
+        _log_gpu_memory("generate_until: before state_dict copy")
         original_state = {k: v.cpu().clone() for k, v in self._base.model.state_dict().items()}
+        _log_gpu_memory("generate_until: after state_dict copy to CPU")
         res = []
 
         for req in requests:
