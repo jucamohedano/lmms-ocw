@@ -14,14 +14,82 @@ Intercepts `generate_until` to:
 """
 import torch
 from torch.optim import AdamW
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
 from src.models._base import Model
-from src.models.apply_svf_to_llm import apply_svf_to_llm
+
 import logging
 
 log = logging.getLogger(__name__)
+
+
+def _fsdp_ensure_initialized(model):
+    """Force FSDP lazy init by running a tiny dummy forward pass.
+
+    FSDP defers internal setup (root detection, handle sharing) until the first
+    ``forward()`` call.  Calling ``state_dict()`` before that corrupts
+    ``_is_root`` flags and raises
+    ``AssertionError: Non-root FSDP instance's `_is_root` should not have been
+    set yet or should have been set to `False```.
+
+    This is a no-op when the model is not FSDP-wrapped or has already been
+    initialised.
+    """
+    if not isinstance(model, FSDP):
+        return
+    # Check if FSDP has already run its lazy init
+    if getattr(model, "_is_root", None) is not None:
+        return
+    log.info("FSDP: triggering lazy init with a dummy forward pass...")
+    device = next(model.parameters()).device
+    dummy = torch.zeros(1, 1, dtype=torch.long, device=device)
+    with torch.no_grad():
+        try:
+            model(input_ids=dummy)
+        except Exception as e:
+            log.debug("FSDP dummy forward failed (expected): %s", e)
+    log.info("FSDP: lazy init complete.")
+
+
+def _fsdp_get_state_dict(model):
+    """Save each rank's local shard to CPU via direct FlatParameter access.
+
+    Avoids FULL_STATE_DICT's expensive All-Gather (each rank gathers the full
+    15 GiB model, fragmenting GPU cache across images) and LOCAL_STATE_DICT's
+    ShardedTensor machinery (which triggers cross-rank requires_grad consistency
+    checks that fail when frozen and trainable params coexist).
+
+    Directly accessing ``_flat_param.data`` gives the raw shard tensor on each
+    rank — plain GPU→CPU copy, zero inter-rank communication.
+    """
+    _fsdp_ensure_initialized(model)
+    if isinstance(model, FSDP):
+        saved = {}
+        for name, module in model.named_modules():
+            fp = getattr(module, "_flat_param", None)
+            if fp is not None:
+                saved[name] = fp.data.detach().cpu().clone()
+        return saved
+    # DDP or single-GPU: plain clone to CPU
+    return {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+
+def _fsdp_set_state_dict(model, state):
+    """Restore each rank's local shard from CPU via direct FlatParameter write.
+
+    Mirrors _fsdp_get_state_dict: writes back to the FlatParameter's data
+    storage directly, bypassing FSDP's state-dict machinery entirely.
+    """
+    if isinstance(model, FSDP):
+        with torch.no_grad():
+            for name, module in model.named_modules():
+                fp = getattr(module, "_flat_param", None)
+                if fp is not None and name in state:
+                    fp.data.copy_(state[name].to(fp.device))
+    else:
+        model.load_state_dict(state)
 
 
 # 10 auxiliary prompts (from the original TTW repo: utils.get_baseline_prompts())
@@ -79,8 +147,9 @@ class TTWModel:
         offline_caption_dir=None,
         ttw_finetune_method="full",  # "full" or "svf" or "lora"
         ttw_lora_backend="peft",  # "peft" or "unsloth"
-        ttw_svf_rank=-1,
-    ):  # SVD truncation rank (-1 = full)
+        ttw_svf_rank=-1,  # SVD truncation rank (-1 = full)
+        ttw_grad_accum=False,  # micro-batch gradient accumulation (fallback for OOM)
+    ):
         self._base = base_model
         self.ttw_lr = ttw_lr
         self.ttw_epochs = ttw_epochs
@@ -96,115 +165,11 @@ class TTWModel:
         self.ttw_finetune_method = ttw_finetune_method
         self.ttw_lora_backend = ttw_lora_backend
         self.ttw_svf_rank = ttw_svf_rank
+        self.ttw_grad_accum = ttw_grad_accum
 
-        # Prepare finetune mode once at init.
-        if self.ttw_finetune_method == "svf":
-            # Apply SVF at init time so we pay the SVD cost once.
-            # The state_dict save/restore in generate_until handles resetting
-            # the S vectors between images.
-            # Use raw _model (not base.model) so we get the HF model with model.model.layers
-            # intact; accelerator.unwrap_model can alter structure in some setups.
-            model_to_svf = getattr(self._base, "_model", self._base.model)
-            self._svf_layers = apply_svf_to_llm(model_to_svf, rank=self.ttw_svf_rank)
-        elif self.ttw_finetune_method == "lora":
-            self._inject_lora_adapters()
-        elif self.ttw_finetune_method != "full":
-            raise ValueError(
-                f"Unknown ttw_finetune_method '{self.ttw_finetune_method}'. "
-                "Expected one of: full, svf, lora."
-            )
-
-    def _inject_lora_adapters(self) -> None:
-        """Attach LoRA adapters using the selected backend."""
-        backend = str(self.ttw_lora_backend).lower()
-        if backend == "unsloth":
-            self._inject_lora_unsloth()
-            return
-        if backend != "peft":
-            log.warning(f"Unknown LoRA backend '{self.ttw_lora_backend}', defaulting to PEFT.")
-        self._inject_lora_peft()
-
-    def _inject_lora_peft(self) -> None:
-        """Attach LoRA adapters with PEFT (default backend)."""
-        try:
-            from peft import LoraConfig, TaskType, get_peft_model
-        except ImportError as exc:
-            raise ImportError(
-                "LoRA finetuning requested but PEFT is not installed. "
-                "Install with `pip install peft`."
-            ) from exc
-
-        model = self._base.model
-
-        # Match the reference TTW repository hyperparameters.
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            lora_dropout=0.05,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
-        )
-
-        # Apply LoRA on the full conditional-generation model. For Qwen2-VL,
-        # target modules (q/k/v/o + gate/up/down) live under `model.layers.*`.
-        # Wrapping the top-level model avoids assuming a specific submodule name
-        # like `language_model` across architectures.
-        peft_model = get_peft_model(model, lora_config)
-        self._base._model = peft_model
-        log.info("Injected LoRA adapters for TTW (backend=peft).")
-
-    def _inject_lora_unsloth(self) -> None:
-        """Attach LoRA adapters with Unsloth; fallback to PEFT on failure."""
-        try:
-            from unsloth import FastVisionModel
-        except ImportError:
-            log.warning(
-                "Unsloth requested for TTW LoRA, but package is not available. "
-                "Falling back to PEFT backend."
-            )
-            self._inject_lora_peft()
-            return
-
-        model = self._base.model
-        try:
-            unsloth_model = FastVisionModel.get_peft_model(
-                model,
-                finetune_vision_layers=False,
-                finetune_language_layers=True,
-                finetune_attention_modules=True,
-                finetune_mlp_modules=True,
-                r=16,
-                lora_alpha=32,
-                lora_dropout=0.05,
-                bias="none",
-                use_gradient_checkpointing="unsloth",
-                random_state=3407,
-                target_modules=[
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                ],
-            )
-            self._base._model = unsloth_model
-            log.info("Injected LoRA adapters for TTW (backend=unsloth).")
-        except Exception as exc:
-            log.warning(
-                "Failed to apply Unsloth LoRA backend; falling back to PEFT. " f"Reason: {exc}"
-            )
-            self._inject_lora_peft()
+        # SVF and LoRA are applied in Qwen2VL._transform_model_before_prepare (before FSDP).
+        # For SVF, the base model stores _svf_layers for warmup.
+        self._svf_layers = getattr(self._base, "_svf_layers", None)
 
     def _unfreeze_connector(self, model) -> None:
         """Unfreeze the vision-language connector (guaranteed in our multimodal setups)."""
@@ -227,6 +192,45 @@ class TTWModel:
             self._clip_model = CLIPModel.from_pretrained(self._clip_model_name).to("cuda").eval()
             self._clip_processor = CLIPProcessor.from_pretrained(self._clip_model_name)
 
+    def _get_prepared_model(self):
+        """Return the model object used for warmup, snapshotting, and inference."""
+        return getattr(self._base, "_model", self._base.model)
+
+    def _snapshot_model_state(self, model):
+        """Snapshot the current model state, preserving local FSDP shards."""
+        state = _fsdp_get_state_dict(model)
+        total_bytes = sum(t.numel() * t.element_size() for t in state.values())
+        log.info(
+            "TTW snapshot captured: %d tensors (%.2f GiB on this rank)",
+            len(state),
+            total_bytes / (1024**3),
+        )
+        return state
+
+    def _restore_model_state(self, model, state) -> None:
+        """Restore the model state from a TTW snapshot."""
+        _fsdp_set_state_dict(model, state)
+        self._maybe_validate_restored_state(model, state)
+
+    def _maybe_validate_restored_state(self, model, expected_state) -> None:
+        """Optionally verify that restore returned the local shards to their snapshot."""
+        import os
+
+        if os.environ.get("TTW_VALIDATE_RESTORE", "0") != "1":
+            return
+
+        restored_state = _fsdp_get_state_dict(model)
+        mismatched = [
+            name
+            for name, tensor in expected_state.items()
+            if name not in restored_state or not torch.equal(restored_state[name], tensor)
+        ]
+        if mismatched:
+            raise RuntimeError(
+                "TTW restore validation failed for local shards: " + ", ".join(mismatched[:5])
+            )
+        log.info("TTW restore validation passed for %d tensors.", len(expected_state))
+
     def __getattr__(self, name):
         """Delegate everything not defined on TTWModel to the base model."""
         return getattr(self._base, name)
@@ -237,6 +241,11 @@ class TTWModel:
             super().__delattr__(name)
         else:
             delattr(self._base, name)
+
+    def _set_requires_grad(self, model, requires_grad: bool) -> None:
+        """Set requires_grad for all model parameters."""
+        for param in model.parameters():
+            param.requires_grad = requires_grad
 
     def _load_offline_captions(self, task_name: str):
         """Load pre-generated captions from JSONL files in offline_caption_dir for the given task."""
@@ -283,13 +292,10 @@ class TTWModel:
             f"Could not find offline captions for task {task_name} in {self.offline_caption_dir}"
         )
 
-    def _ttw_warmup(self, image: Image.Image, task_name: str = None, doc_id: int = None):
-        """Run TTW warmup: fetch or generate captions, train on best."""
-        model = getattr(self._base, "_model", self._base.model)  # use prepared model for DDP
-
-        log.info("Starting TTW Warmup for new image...")
-
-        # 1. Fetch or Generate Captions
+    def _get_warmup_captions(
+        self, image: Image.Image, task_name: str | None = None, doc_id: int | None = None
+    ) -> list[tuple[str, str]]:
+        """Fetch offline warmup captions or generate them online with CLIP filtering."""
         warmup_captions = []
         if self.offline_caption_dir and task_name and doc_id is not None:
             if task_name not in self._offline_captions:
@@ -332,43 +338,32 @@ class TTWModel:
                 best = candidates[scores.argmax().item()]
                 warmup_captions.append((prompt, best))
                 log.debug(f"Prompt: {prompt}\n  Best Caption: {best}")
+        return warmup_captions
 
-        # 2. Freeze/unfreeze based on finetuning method
+    def _configure_trainable_params(self, model):
+        """Apply the selected TTW finetuning policy and return trainable params."""
         _log_gpu_memory("TTW warmup: before freeze/unfreeze")
         if self.ttw_finetune_method == "svf":
             # SVF layers were replaced at init. Freeze everything, then unfreeze
-            # only the S vectors and the connector (state_dict restore in generate_until resets requires_grad).
-            for param in model.parameters():
-                param.requires_grad = False
+            # only the S vectors and the connector.
+            self._set_requires_grad(model, False)
             for svf in self._svf_layers:
                 svf.S.requires_grad_(True)
-                # if svf.bias is not None:
-                #     svf.bias.requires_grad_(True)
-            # Also unfreeze the vision-language connector (matches original TTW repo) and don't apply svf to it
             self._unfreeze_connector(model)
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             log.debug(f"SVF: {sum(p.numel() for p in trainable_params):,} trainable params")
         elif self.ttw_finetune_method == "lora":
-            # LoRA TTW mode: train only LoRA params + connector.
-            for param in model.parameters():
-                param.requires_grad = False
-
+            self._set_requires_grad(model, False)
             for name, param in model.named_parameters():
                 if "lora_" in name:
                     param.requires_grad = True
-
             self._unfreeze_connector(model)
-
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             log.debug(f"LoRA: {sum(p.numel() for p in trainable_params):,} trainable params")
         else:
-            # Full FT: unfreeze everything, then freeze vision
             log.debug("Freezing vision encoders and unfreezing LLM and connector...")
-            for param in model.parameters():
-                param.requires_grad = True
-
-            vision_modules = self._base.ttw_get_vision_encoder()
-            for module in vision_modules:
+            self._set_requires_grad(model, True)
+            for module in self._base.ttw_get_vision_encoder():
                 for param in module.parameters():
                     param.requires_grad = False
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -381,21 +376,26 @@ class TTWModel:
             trainable_gib,
             3 * trainable_gib,
         )
+        return trainable_params
 
-        # 3. Warmup training – simple loop matching the original TTW repo.
-        # With DDP each replica trains on the same captions (correct for
-        # per-image adaptation). No Accelerate accumulate() needed.
-        if self.ttw_finetune_method == "full":
-            try:
-                import bitsandbytes as bnb
+    def _enable_gradient_checkpointing(self, model) -> None:
+        """Enable checkpointing in the FSDP-safe non-reentrant mode."""
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            log.info("TTW: gradient checkpointing enabled (use_reentrant=False)")
 
-                optimizer = bnb.optim.AdamW8bit(trainable_params, lr=self.ttw_lr)
-                log.info("TTW: using 8-bit AdamW (bitsandbytes)")
-            except ImportError:
-                log.warning("bitsandbytes not installed, falling back to regular AdamW")
-                optimizer = AdamW(trainable_params, lr=self.ttw_lr, foreach=False)
-        else:
-            optimizer = AdamW(trainable_params, lr=self.ttw_lr, foreach=False)
+    def _disable_gradient_checkpointing(self, model) -> None:
+        """Disable gradient checkpointing after TTW warmup."""
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+
+    def _run_warmup_optimization(
+        self, model, image: Image.Image, warmup_captions, trainable_params
+    ):
+        """Run the TTW optimization loop for a single image."""
+        optimizer = AdamW(trainable_params, lr=self.ttw_lr, foreach=False)
 
         log.info(
             "TTW warmup: method=%s epochs=%d lr=%s batch_size=%d",
@@ -406,18 +406,11 @@ class TTWModel:
         )
         model_dtype = getattr(self._base.model, "dtype", torch.bfloat16)
 
-        if hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable()
-            log.info("TTW: gradient checkpointing enabled")
-
+        self._enable_gradient_checkpointing(model)
         model.train()
         _log_gpu_memory("TTW warmup: before training loop")
 
-        # Full FT uses gradient accumulation (micro-batch size 1) to avoid OOM
-        # with ~7.6B trainable params. LoRA/SVF have small trainable param counts
-        # so they can forward the full batch at once for speed.
-        use_grad_accum = self.ttw_finetune_method == "full"
-
+        use_grad_accum = self.ttw_grad_accum
         with torch.enable_grad(), torch.autocast("cuda", dtype=model_dtype):
             for epoch in range(self.ttw_epochs):
                 for start in range(0, len(warmup_captions), self.ttw_batch_size):
@@ -449,16 +442,39 @@ class TTWModel:
                 if epoch == 0:
                     _log_gpu_memory("TTW warmup: after epoch 1")
 
-        if hasattr(model, "gradient_checkpointing_disable"):
-            model.gradient_checkpointing_disable()
-
+        self._disable_gradient_checkpointing(model)
         model.eval()
         del optimizer, trainable_params
         torch.cuda.empty_cache()
-        for param in model.parameters():
-            param.requires_grad = False
+        self._set_requires_grad(model, False)
         _log_gpu_memory("TTW warmup: done")
         log.info("TTW warmup finished.")
+
+    def _ttw_warmup(self, image: Image.Image, task_name: str = None, doc_id: int = None):
+        """Run TTW warmup: fetch captions, configure trainables, and optimize."""
+        model = self._get_prepared_model()
+        log.info("Starting TTW Warmup for new image...")
+
+        warmup_captions = self._get_warmup_captions(image, task_name=task_name, doc_id=doc_id)
+        trainable_params = self._configure_trainable_params(model)
+        self._run_warmup_optimization(model, image, warmup_captions, trainable_params)
+
+    def _get_first_request_image(self, req):
+        """Extract the first PIL image and TTW metadata from a request."""
+        args = req.args
+        doc_to_visual_fn = args[2]
+        doc_id = args[3]
+        task = args[4]
+        split = args[5]
+
+        doc = self._base.task_dict[task][split][doc_id]
+        visuals = doc_to_visual_fn(doc)
+        image = next((vis for vis in visuals if isinstance(vis, Image.Image)), None)
+        return image, task, doc_id
+
+    def _generate_single_request_with_fsdp_support(self, prepared_model, req):
+        """Delegate single-request generation to the base model."""
+        return self._base.generate_until([req])
 
     def _ttw_build_training_batch(self, image, warmup_captions):
         """Build a training batch from (prompt, caption) pairs with proper label masking.
@@ -585,32 +601,22 @@ class TTWModel:
         Images are extracted via the doc_to_visual mechanism in TaskInstance.args:
         args = (context, gen_kwargs, doc_to_visual_fn, doc_id, task, split)
         """
+        prepared_model = self._get_prepared_model()
+
         _log_gpu_memory("generate_until: before state_dict copy")
-        original_state = {k: v.cpu().clone() for k, v in self._base.model.state_dict().items()}
+        original_state = self._snapshot_model_state(prepared_model)
         _log_gpu_memory("generate_until: after state_dict copy to CPU")
         res = []
 
         for req in requests:
-            args = req.args
-            doc_to_visual_fn = args[2]
-            doc_id = args[3]
-            task = args[4]
-            split = args[5]
+            image, task, doc_id = self._get_first_request_image(req)
+            if image is not None:
+                self._ttw_warmup(image, task_name=task, doc_id=doc_id)
 
-            doc = self._base.task_dict[task][split][doc_id]
-            visuals = doc_to_visual_fn(doc)
-
-            # TTW warmup on the first image
-            for vis in visuals:
-                if isinstance(vis, Image.Image):
-                    self._ttw_warmup(vis, task_name=task, doc_id=doc_id)
-                    break
-
-            # Infer on this single request with warmed-up weights
-            single_result = self._base.generate_until([req])
+            single_result = self._generate_single_request_with_fsdp_support(prepared_model, req)
             res.extend(single_result)
 
-            # Restore original weights for the next request
-            self._base.model.load_state_dict(original_state)
+            self._restore_model_state(prepared_model, original_state)
+            _log_gpu_memory("generate_until: after restore")
 
         return res

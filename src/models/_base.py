@@ -146,6 +146,8 @@ class Model(ABC):
         if self._model is None:
             raise ValueError("The `load_model` method must set the attribute `_model`!")
 
+        self._transform_model_before_prepare()
+
         # Setup the accelerator
         if self.accelerator.num_processes > 1:
             if self.accelerator.distributed_type not in self._distributed_types:
@@ -294,6 +296,14 @@ class Model(ABC):
     def load_model(self) -> None:
         """Load the model in memory."""
         raise NotImplementedError
+
+    def _transform_model_before_prepare(self) -> None:  # noqa: B027
+        """Transform the model after load_model() and before accelerator.prepare().
+
+        Subclasses (e.g. Qwen2VL with TTW) override this to apply SVF, PEFT LoRA,
+        or other adapters that must be part of the model graph before FSDP wrapping.
+        """
+        pass
 
     @abstractmethod
     def loglikelihood(self, requests: list[TaskInstance]) -> list[tuple[float, bool]]:
