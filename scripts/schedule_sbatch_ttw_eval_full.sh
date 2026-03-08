@@ -5,8 +5,29 @@ timestamp="$(date +%Y%m%d-%H%M%S)"
 log_dir="./logs/slurm"
 method="full"
 num_gpus="${1:-2}"
+# Use $# so '' as 2nd arg means "no limit" (full dataset)
+if [[ $# -ge 2 ]]; then eval_limit="$2"; else eval_limit="4"; fi
+fsdp_state_dict_type="${FSDP_STATE_DICT_TYPE:-SHARDED_STATE_DICT}"
+fsdp_use_orig_params="${FSDP_USE_ORIG_PARAMS:-True}"
+ttw_validate_restore="${TTW_VALIDATE_RESTORE:-0}"
 model="qwen2-vl-7b-ttw"
+# When eval_limit is empty, run on full dataset; use "full" in experiment name
+limit_suffix="${eval_limit:-full}"
 experiment="ttw_${method}"
+wandb_args="${EVAL_WANDB_ARGS:-project=lmms-owc,job_type=eval}"
+# Build --limit arg only when eval_limit is non-empty.
+# When empty, use continuation line (\) so the python command doesn't break.
+if [[ -n "${eval_limit}" ]]; then
+    limit_line="    --limit ${eval_limit} \\"
+else
+    limit_line="    \\"
+fi
+# Build --wandb_args when EVAL_WANDB_ARGS is set (e.g. project=lmms-owc,job_type=eval)
+if [[ -n "${wandb_args}" ]]; then
+    wandb_line="    --wandb_args \"${wandb_args}\" \\"
+else
+    wandb_line="    \\"
+fi
 mkdir -p "$log_dir"
 
 EVAL_TASKS="caltech101,dtd,flowers102,oxford_pets,ucf101"
@@ -50,8 +71,13 @@ export CXX=g++
 
 # Ensure HuggingFace works offline on compute nodes
 export HF_HUB_OFFLINE=1
-# Reduce CUDA memory fragmentation (helps with full FT OOM)
+# WandB offline (compute nodes have no internet)
+export WANDB_MODE=offline
+
+# Reduce CUDA memory fragmentation (helps with full FT OOM over many images)
+# Note: PYTORCH_CUDA_ALLOC_CONF was renamed back to PYTORCH_ALLOC_CONF in PyTorch 2.9
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+export TTW_VALIDATE_RESTORE="${ttw_validate_restore}"
 
 # Activate your environment
 source "\$(pwd)"/.venv/bin/activate
@@ -75,21 +101,35 @@ echo "Starting TTW evaluation on node \$(hostname)..."
 echo "Task: \${task}  Model: ${model}  Method: ${method}"
 echo "Results will be saved to: \${EVAL_OUTPUT_DIR}"
 echo "Accelerate processes: \${ACCELERATE_NUM_PROCESSES}"
+echo "Eval limit: ${limit_suffix}"
+echo "FSDP state dict type: ${fsdp_state_dict_type}"
+echo "FSDP use_orig_params: ${fsdp_use_orig_params}"
+echo "TTW restore validation: ${ttw_validate_restore}"
+echo "WandB: ${wandb_args:-disabled}"
 
 python -m accelerate.commands.launch \\
     --main_process_port="\${ACCELERATE_MAIN_PROCESS_PORT}" \\
     --num_processes="\${ACCELERATE_NUM_PROCESSES}" \\
     --mixed_precision=bf16 \\
+    --use_fsdp \\
+    --fsdp_sharding_strategy=FULL_SHARD \\
+    --fsdp_auto_wrap_policy=TRANSFORMER_BASED_WRAP \\
+    --fsdp_transformer_layer_cls_to_wrap=Qwen2VLDecoderLayer \\
+    --fsdp_state_dict_type="${fsdp_state_dict_type}" \\
+    --fsdp_use_orig_params="${fsdp_use_orig_params}" \\
     -m eval_model \\
     --model ${model} \\
     --model_args offline_caption_dir=./offline_captions/,ttw_finetune_method=${method} \\
     --tasks "\${task}" \\
     --output_path "\${EVAL_OUTPUT_DIR}" \\
     --batch_size 1 \\
+${limit_line}
+${wandb_line}
     --log_samples \\
     --seed 30
+    # To fall back to DDP+grad_accum: remove FSDP flags, add ,ttw_grad_accum=True to --model_args
 
 echo "TTW evaluation finished for \${task}. Results in: \${EVAL_OUTPUT_DIR}"
 EOT
 
-echo "Submitted SLURM array with ${NUM_JOBS} jobs for ${model} (method=${method})"
+echo "Submitted SLURM array with ${NUM_JOBS} jobs for ${model} (method=${method}, gpus=${num_gpus}, limit=${limit_suffix})"

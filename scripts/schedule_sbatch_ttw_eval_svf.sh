@@ -4,8 +4,26 @@ set -euo pipefail
 timestamp="$(date +%Y%m%d-%H%M%S)"
 log_dir="./logs/slurm"
 method="svf"
+num_gpus="${1:-1}"
+# Use $# so '' as 2nd arg means "no limit" (full dataset)
+if [[ $# -ge 2 ]]; then eval_limit="$2"; else eval_limit="4"; fi
 model="qwen2-vl-7b-ttw"
+limit_suffix="${eval_limit:-full}"
 experiment="ttw_${method}"
+wandb_args="${EVAL_WANDB_ARGS:-project=lmms-owc,job_type=eval}"
+# Build --limit arg only when eval_limit is non-empty.
+# When empty, use continuation line (\) so the python command doesn't break.
+if [[ -n "${eval_limit}" ]]; then
+    limit_line="    --limit ${eval_limit} \\"
+else
+    limit_line="    \\"
+fi
+# Build --wandb_args when EVAL_WANDB_ARGS is set (e.g. project=lmms-owc,job_type=eval)
+if [[ -n "${wandb_args}" ]]; then
+    wandb_line="    --wandb_args \"${wandb_args}\" \\"
+else
+    wandb_line="    \\"
+fi
 mkdir -p "$log_dir"
 
 EVAL_TASKS="caltech101,dtd,flowers102,oxford_pets,ucf101"
@@ -28,7 +46,7 @@ sbatch <<EOT
 #SBATCH --array=1-${NUM_JOBS}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:${num_gpus}
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
 #SBATCH --output="${log_dir}/ttw_eval_${method}_${timestamp}_%A_%a.out"
@@ -38,7 +56,7 @@ sbatch <<EOT
 # TTW Evaluation with Offline Captions (SVF)
 #
 # Evaluates ${model} on classification tasks using SVF finetuning.
-# Uses SLURM arrays to run one task per job for make_table.py compatibility.
+# Uses DDP (no FSDP). SLURM arrays run one task per job.
 # -----------------------------------------------------------
 
 # Load the required modules
@@ -49,9 +67,11 @@ export CXX=g++
 
 # Ensure HuggingFace works offline on compute nodes
 export HF_HUB_OFFLINE=1
+# WandB offline (compute nodes have no internet)
+export WANDB_MODE=offline
 
-# Reduce OOM risk
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Reduce CUDA memory fragmentation
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 # Activate your environment
 source "\$(pwd)"/.venv/bin/activate
@@ -74,20 +94,26 @@ EVAL_OUTPUT_DIR="logs/schedule/\${task}_${experiment}/${model}"
 echo "Starting TTW evaluation on node \$(hostname)..."
 echo "Task: \${task}  Model: ${model}  Method: ${method}"
 echo "Results will be saved to: \${EVAL_OUTPUT_DIR}"
+echo "Accelerate processes: \${ACCELERATE_NUM_PROCESSES}"
+echo "Eval limit: ${limit_suffix}"
+echo "WandB: ${wandb_args:-disabled}"
 
 python -m accelerate.commands.launch \\
     --main_process_port="\${ACCELERATE_MAIN_PROCESS_PORT}" \\
     --num_processes="\${ACCELERATE_NUM_PROCESSES}" \\
+    --mixed_precision=bf16 \\
     -m eval_model \\
     --model ${model} \\
-    --model_args offline_caption_dir=./offline_captions/,ttw_finetune_method=${method},ttw_lr=1e-4,ttw_epochs=5 \\
+    --model_args offline_caption_dir=./offline_captions/,ttw_finetune_method=${method},ttw_svf_rank=-1,ttw_lr=1e-4,ttw_epochs=5 \\
     --tasks "\${task}" \\
     --output_path "\${EVAL_OUTPUT_DIR}" \\
     --batch_size 1 \\
+${limit_line}
+${wandb_line}
     --log_samples \\
     --seed 30
 
 echo "TTW evaluation finished for \${task}. Results in: \${EVAL_OUTPUT_DIR}"
 EOT
 
-echo "Submitted SLURM array with ${NUM_JOBS} jobs for ${model} (method=${method})"
+echo "Submitted SLURM array with ${NUM_JOBS} jobs for ${model} (method=${method}, gpus=${num_gpus}, limit=${limit_suffix})"
