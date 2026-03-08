@@ -13,6 +13,7 @@ Intercepts `generate_until` to:
 
 """
 import torch
+import torch.distributed as dist
 from torch.optim import AdamW
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from PIL import Image
@@ -123,6 +124,39 @@ def _log_gpu_memory(label: str) -> None:
             total,
             reserved,
         )
+
+
+def _ttw_log_loss_to_wandb(
+    loss: float,
+    rank: int,
+    world_size: int,
+    global_step: int,
+    device: torch.device | None = None,
+) -> None:
+    """Log TTW warmup loss (averaged across ranks) to WandB when enabled (--wandb_args).
+
+    Only rank 0 logs. In distributed mode, loss is all-reduced and averaged first.
+    All ranks must participate in all_reduce (collective) to avoid deadlock.
+    """
+    dev = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+
+    if dist.is_initialized() and world_size > 1:
+        loss_tensor = torch.tensor([loss], dtype=torch.float32, device=dev)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        loss_to_log = loss_tensor.item() / world_size
+    else:
+        loss_to_log = loss
+
+    if rank != 0:
+        return
+
+    try:
+        import wandb
+
+        if wandb.run is not None:
+            wandb.log({"ttw_warmup/loss": loss_to_log}, step=global_step)
+    except ImportError:
+        log.warning("WandB not found, skipping loss logging.")
 
 
 class TTWModel:
@@ -392,7 +426,13 @@ class TTWModel:
             model.gradient_checkpointing_disable()
 
     def _run_warmup_optimization(
-        self, model, image: Image.Image, warmup_captions, trainable_params
+        self,
+        model,
+        image: Image.Image,
+        warmup_captions,
+        trainable_params,
+        task_name: str | None = None,
+        doc_id: int | None = None,
     ):
         """Run the TTW optimization loop for a single image."""
         optimizer = AdamW(trainable_params, lr=self.ttw_lr, foreach=False)
@@ -409,6 +449,9 @@ class TTWModel:
         self._enable_gradient_checkpointing(model)
         model.train()
         _log_gpu_memory("TTW warmup: before training loop")
+
+        device = next(model.parameters()).device
+        world_size = getattr(self._base, "world_size", 1)
 
         use_grad_accum = self.ttw_grad_accum
         with torch.enable_grad(), torch.autocast("cuda", dtype=model_dtype):
@@ -438,6 +481,16 @@ class TTWModel:
                         start // self.ttw_batch_size + 1,
                         step_loss,
                     )
+                    # Log TTW warmup loss to WandB when enabled (e.g. --wandb_args project=...)
+                    global_step = getattr(self, "_ttw_wandb_step", 0)
+                    _ttw_log_loss_to_wandb(
+                        step_loss,
+                        self._base.rank,
+                        world_size,
+                        global_step,
+                        device=device,
+                    )
+                    self._ttw_wandb_step = global_step + 1
                     torch.cuda.empty_cache()
                 if epoch == 0:
                     _log_gpu_memory("TTW warmup: after epoch 1")
@@ -457,7 +510,14 @@ class TTWModel:
 
         warmup_captions = self._get_warmup_captions(image, task_name=task_name, doc_id=doc_id)
         trainable_params = self._configure_trainable_params(model)
-        self._run_warmup_optimization(model, image, warmup_captions, trainable_params)
+        self._run_warmup_optimization(
+            model,
+            image,
+            warmup_captions,
+            trainable_params,
+            task_name=task_name,
+            doc_id=doc_id,
+        )
 
     def _get_first_request_image(self, req):
         """Extract the first PIL image and TTW metadata from a request."""

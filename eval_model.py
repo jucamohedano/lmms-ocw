@@ -296,14 +296,58 @@ def main(args: argparse.Namespace) -> None:
         print("└────────────────────────────────────────────────────────────────────────────────┘")
         sys.exit(1)
 
-    if args.wandb_args:
-        if "name" not in args.wandb_args:
-            name = (
-                f"{args.model}_{args.model_args}_{utils.get_datetime_str(timezone=args.timezone)}"
+    # Only rank 0 initializes WandB to avoid duplicate runs and teardown hangs
+    # on non-main ranks. TTW only needs a lightweight run for warmup-loss logging.
+    _is_rank_zero = os.environ.get("LOCAL_RANK", "0") == "0"
+    wandb_logger = None
+    wandb_run = None
+    model_args_parsed = utils.parse_string_args(args.model_args or "")
+    is_ttw_run = "ttw_finetune_method" in model_args_parsed
+    if args.wandb_args and _is_rank_zero:
+        wandb_kwargs = utils.parse_string_args(args.wandb_args)
+        if "name" not in wandb_kwargs:
+            ttw_method = model_args_parsed.get("ttw_finetune_method", "")
+            tasks_slug = (args.tasks or "unknown").replace(",", "_")[:64]
+            name_parts = [args.model, tasks_slug]
+            if ttw_method:
+                name_parts.append(ttw_method)
+            name_parts.append(utils.get_datetime_str(timezone=args.timezone))
+            name = utils.sanitize_long_string("_".join(filter(None, name_parts)))
+            wandb_kwargs["name"] = name
+        wandb_config = {
+            "model": args.model,
+            "tasks": args.tasks,
+            "model_args": args.model_args,
+            "batch_size": args.batch_size,
+            "limit": args.limit,
+            "seed": args.seed,
+        }
+        ttw_keys = [
+            "ttw_finetune_method",
+            "ttw_lora_backend",
+            "ttw_svf_rank",
+            "ttw_lr",
+            "ttw_epochs",
+            "ttw_batch_size",
+            "ttw_num_candidates",
+            "ttw_caption_temperature",
+            "ttw_max_new_tokens",
+            "ttw_grad_accum",
+        ]
+        for key in ttw_keys:
+            if key in model_args_parsed:
+                wandb_config[key] = model_args_parsed[key]
+        wandb_kwargs["config"] = wandb_config
+
+        if is_ttw_run:
+            import wandb
+
+            wandb_kwargs["mode"] = os.environ.get(
+                "WANDB_MODE", wandb_kwargs.get("mode", "offline")
             )
-            name = utils.sanitize_long_string(name)
-            args.wandb_args += f",name={name}"
-        wandb_logger = WandbLogger(**utils.parse_string_args(args.wandb_args))
+            wandb_run = wandb.init(**wandb_kwargs)
+        else:
+            wandb_logger = WandbLogger(**wandb_kwargs)
 
     # Set logging level from CLI argument
     eval_logger_level = getattr(logging, args.log_level.upper(), logging.INFO)
@@ -347,7 +391,7 @@ def main(args: argparse.Namespace) -> None:
             results_list.append(results)
 
             accelerator.wait_for_everyone()
-            if is_main_process and args.wandb_args:
+            if is_main_process and wandb_logger is not None:
                 try:
                     wandb_logger.post_init(results)
                     wandb_logger.log_eval_result()
@@ -379,8 +423,10 @@ def main(args: argparse.Namespace) -> None:
             if "groups" in results:
                 print(utils.make_table(results, "groups"))
 
-    if args.wandb_args:
+    if wandb_logger is not None:
         wandb_logger.run.finish()
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
