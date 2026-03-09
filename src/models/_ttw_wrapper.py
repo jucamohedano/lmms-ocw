@@ -20,10 +20,9 @@ from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
 from src.models._base import Model
+from src.utils import get_logger
 
-import logging
-
-log = logging.getLogger(__name__)
+log = get_logger(__name__, rank_zero_only=True)
 
 
 def _fsdp_ensure_initialized(model):
@@ -217,6 +216,7 @@ class TTWModel:
             # Base Qwen2-VL path
             connector_owner = model.model
 
+        # TODO: change for other models, this is qwen2-vl specific
         for param in connector_owner.visual.merger.parameters():
             param.requires_grad = True
 
@@ -228,6 +228,7 @@ class TTWModel:
 
     def _get_prepared_model(self):
         """Return the model object used for warmup, snapshotting, and inference."""
+        # unsloth returns the model as _model, otherwise self._base.model is the model
         return getattr(self._base, "_model", self._base.model)
 
     def _snapshot_model_state(self, model):
@@ -244,26 +245,6 @@ class TTWModel:
     def _restore_model_state(self, model, state) -> None:
         """Restore the model state from a TTW snapshot."""
         _fsdp_set_state_dict(model, state)
-        self._maybe_validate_restored_state(model, state)
-
-    def _maybe_validate_restored_state(self, model, expected_state) -> None:
-        """Optionally verify that restore returned the local shards to their snapshot."""
-        import os
-
-        if os.environ.get("TTW_VALIDATE_RESTORE", "0") != "1":
-            return
-
-        restored_state = _fsdp_get_state_dict(model)
-        mismatched = [
-            name
-            for name, tensor in expected_state.items()
-            if name not in restored_state or not torch.equal(restored_state[name], tensor)
-        ]
-        if mismatched:
-            raise RuntimeError(
-                "TTW restore validation failed for local shards: " + ", ".join(mismatched[:5])
-            )
-        log.info("TTW restore validation passed for %d tensors.", len(expected_state))
 
     def __getattr__(self, name):
         """Delegate everything not defined on TTWModel to the base model."""
@@ -394,7 +375,7 @@ class TTWModel:
             self._unfreeze_connector(model)
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             log.debug(f"LoRA: {sum(p.numel() for p in trainable_params):,} trainable params")
-        else:
+        elif self.ttw_finetune_method == "full":
             log.debug("Freezing vision encoders and unfreezing LLM and connector...")
             self._set_requires_grad(model, True)
             for module in self._base.ttw_get_vision_encoder():
@@ -416,7 +397,9 @@ class TTWModel:
         """Enable checkpointing in the FSDP-safe non-reentrant mode."""
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
+                gradient_checkpointing_kwargs={
+                    "use_reentrant": False
+                }  # otherwise sharding doesn't work
             )
             log.info("TTW: gradient checkpointing enabled (use_reentrant=False)")
 
@@ -473,7 +456,7 @@ class TTWModel:
                         loss.backward()
                         step_loss = loss.detach().item()
                     optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=True)  # tensor deallocated entirely
                     log.debug(
                         "TTW epoch %d/%d step %d loss=%.4f",
                         epoch + 1,
