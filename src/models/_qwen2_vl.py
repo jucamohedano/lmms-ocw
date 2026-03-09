@@ -130,9 +130,9 @@ class Qwen2VL(Model):
     def load_model(self) -> None:
         """Load the model in memory."""
         # Unsloth is incompatible with FSDP; use standard HF path when distributed.
-        use_unsloth_load = self._lora_backend == "unsloth" and not (
-            self.accelerator.num_processes > 1
-            and self.accelerator.distributed_type == DistributedType.FSDP
+        use_unsloth_load = (
+            self._lora_backend == "unsloth"
+            and self.accelerator.distributed_type != DistributedType.FSDP
         )
         if not use_unsloth_load and self._lora_backend == "unsloth":
             log.info(
@@ -222,10 +222,7 @@ class Qwen2VL(Model):
             log.info("Applied SVF to model (rank=%d) before FSDP prepare.", self._ttw_svf_rank)
         elif self._ttw_finetune_method == "lora":
             backend = self._ttw_lora_backend
-            use_fsdp = (
-                self.accelerator.num_processes > 1
-                and self.accelerator.distributed_type == DistributedType.FSDP
-            )
+            use_fsdp = self.accelerator.distributed_type == DistributedType.FSDP
             if use_fsdp and backend == "unsloth":
                 log.info("Unsloth requested but FSDP detected; applying PEFT LoRA instead.")
                 backend = "peft"
