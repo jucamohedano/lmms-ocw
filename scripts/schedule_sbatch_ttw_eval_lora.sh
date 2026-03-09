@@ -26,7 +26,8 @@ else
 fi
 mkdir -p "$log_dir"
 
-EVAL_TASKS="caltech101,dtd,flowers102,oxford_pets,ucf101"
+# EVAL_TASKS="caltech101,dtd,flowers102,oxford_pets,ucf101"
+EVAL_TASKS="oxford_pets"
 # Split comma-separated values into array
 IFS=',' read -ra EVAL_TASKS_ARRAY <<< "$EVAL_TASKS"
 
@@ -72,6 +73,8 @@ export WANDB_MODE=offline
 
 # Reduce CUDA memory fragmentation
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export UNSLOTH_COMPILE_DISABLE=1
 
 # Activate your environment
 source "\$(pwd)"/.venv/bin/activate
