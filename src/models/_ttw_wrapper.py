@@ -12,6 +12,11 @@ Intercepts `generate_until` to:
   3. Restore original weights
 
 """
+import csv
+import gc
+import os
+from datetime import datetime
+
 import torch
 import torch.distributed as dist
 from torch.optim import AdamW
@@ -23,6 +28,10 @@ from src.models._base import Model
 from src.utils import get_logger
 
 log = get_logger(__name__, rank_zero_only=True)
+
+# Per-process CSV file and writer for GPU memory logging (lazily opened)
+_gpu_csv_file = None
+_gpu_csv_writer = None
 
 
 def _fsdp_ensure_initialized(model):
@@ -107,22 +116,74 @@ TTW_AUXILIARY_PROMPTS = [
 ]
 
 
-def _log_gpu_memory(label: str) -> None:
-    """Log per-GPU memory for debugging OOM issues."""
+def _ensure_gpu_csv_open(rank: int) -> None:
+    """Open the GPU memory CSV file on first use."""
+    global _gpu_csv_file, _gpu_csv_writer
+    if _gpu_csv_file is not None:
+        return
+    log_dir = "logs/gpu"
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(log_dir, f"ttw_gpu_memory_{timestamp}_rank{rank}.csv")
+    _gpu_csv_file = open(path, "w", newline="", encoding="utf-8")
+    _gpu_csv_writer = csv.writer(_gpu_csv_file)
+    _gpu_csv_writer.writerow(
+        [
+            "timestamp",
+            "rank",
+            "doc_id",
+            "phase",
+            "gpu_id",
+            "alloc_gib",
+            "reserved_gib",
+            "total_gib",
+        ]
+    )
+    _gpu_csv_file.flush()
+    log.info("GPU memory CSV: %s", path)
+
+
+def _log_gpu_memory(
+    label: str,
+    doc_id: int | None = None,
+    rank: int | None = None,
+) -> None:
+    """Log per-GPU memory for debugging OOM issues. Optionally append to CSV in logs/gpu/."""
     if not torch.cuda.is_available():
         return
+    r = rank if rank is not None else (dist.get_rank() if dist.is_initialized() else 0)
+    ts = datetime.now().isoformat()
     for i in range(torch.cuda.device_count()):
         alloc = torch.cuda.memory_allocated(i) / (1024**3)
         reserved = torch.cuda.memory_reserved(i) / (1024**3)
         total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
         log.info(
-            "[GPU %d] %s: %.2f/%.2f GiB allocated (%.2f GiB reserved)",
+            "[Rank %d GPU %d] %s: %.2f/%.2f GiB allocated (%.2f GiB reserved)",
+            r,
             i,
             label,
             alloc,
             total,
             reserved,
         )
+        # Append to CSV for later analysis
+        try:
+            _ensure_gpu_csv_open(r)
+            _gpu_csv_writer.writerow(
+                [
+                    ts,
+                    r,
+                    doc_id if doc_id is not None else "",
+                    label,
+                    i,
+                    f"{alloc:.2f}",
+                    f"{reserved:.2f}",
+                    f"{total:.2f}",
+                ]
+            )
+            _gpu_csv_file.flush()
+        except Exception as e:
+            log.debug("Failed to write GPU CSV: %s", e)
 
 
 def _ttw_log_loss_to_wandb(
@@ -355,9 +416,10 @@ class TTWModel:
                 log.debug(f"Prompt: {prompt}\n  Best Caption: {best}")
         return warmup_captions
 
-    def _configure_trainable_params(self, model):
+    def _configure_trainable_params(self, model, doc_id: int | None = None):
         """Apply the selected TTW finetuning policy and return trainable params."""
-        _log_gpu_memory("TTW warmup: before freeze/unfreeze")
+        rank = getattr(self._base, "rank", 0)
+        _log_gpu_memory("TTW warmup: before freeze/unfreeze", doc_id=doc_id, rank=rank)
         if self.ttw_finetune_method == "svf":
             # SVF layers were replaced at init. Freeze everything, then unfreeze
             # only the S vectors and the connector.
@@ -391,6 +453,7 @@ class TTWModel:
             trainable_gib,
             3 * trainable_gib,
         )
+        _log_gpu_memory("TTW warmup: after freeze/unfreeze", doc_id=doc_id, rank=rank)
         return trainable_params
 
     def _enable_gradient_checkpointing(self, model) -> None:
@@ -431,7 +494,8 @@ class TTWModel:
 
         self._enable_gradient_checkpointing(model)
         model.train()
-        _log_gpu_memory("TTW warmup: before training loop")
+        rank = getattr(self._base, "rank", 0)
+        _log_gpu_memory("TTW warmup: before training loop", doc_id=doc_id, rank=rank)
 
         device = next(model.parameters()).device
         world_size = getattr(self._base, "world_size", 1)
@@ -446,17 +510,31 @@ class TTWModel:
                         for caption_pair in batch_captions:
                             micro_batch = self._ttw_build_training_batch(image, [caption_pair])
                             outputs = model(**micro_batch)
+                            _log_gpu_memory(
+                                "TTW warmup: after forward (grad_accum)", doc_id=doc_id, rank=rank
+                            )
                             loss = outputs.loss
                             loss.backward()
+                            _log_gpu_memory(
+                                "TTW warmup: after backward (grad_accum)", doc_id=doc_id, rank=rank
+                            )
                             step_loss += loss.detach().item()
                     else:
                         batch_inputs = self._ttw_build_training_batch(image, batch_captions)
+                        _log_gpu_memory(
+                            "TTW warmup: after build_batch (before forward)",
+                            doc_id=doc_id,
+                            rank=rank,
+                        )
                         outputs = model(**batch_inputs)
+                        _log_gpu_memory("TTW warmup: after forward", doc_id=doc_id, rank=rank)
                         loss = outputs.loss
                         loss.backward()
+                        _log_gpu_memory("TTW warmup: after backward", doc_id=doc_id, rank=rank)
                         step_loss = loss.detach().item()
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)  # tensor deallocated entirely
+                    _log_gpu_memory("TTW warmup: after optimizer.step", doc_id=doc_id, rank=rank)
                     log.debug(
                         "TTW epoch %d/%d step %d loss=%.4f",
                         epoch + 1,
@@ -476,14 +554,14 @@ class TTWModel:
                     self._ttw_wandb_step = global_step + 1
                     torch.cuda.empty_cache()
                 if epoch == 0:
-                    _log_gpu_memory("TTW warmup: after epoch 1")
+                    _log_gpu_memory("TTW warmup: after epoch 1", doc_id=doc_id, rank=rank)
 
         self._disable_gradient_checkpointing(model)
         model.eval()
         del optimizer, trainable_params
         torch.cuda.empty_cache()
         self._set_requires_grad(model, False)
-        _log_gpu_memory("TTW warmup: done")
+        _log_gpu_memory("TTW warmup: done", doc_id=doc_id, rank=rank)
         log.info("TTW warmup finished.")
 
     def _ttw_warmup(self, image: Image.Image, task_name: str = None, doc_id: int = None):
@@ -492,7 +570,11 @@ class TTWModel:
         log.info("Starting TTW Warmup for new image...")
 
         warmup_captions = self._get_warmup_captions(image, task_name=task_name, doc_id=doc_id)
-        trainable_params = self._configure_trainable_params(model)
+        rank = getattr(self._base, "rank", 0)
+        _log_gpu_memory(
+            "TTW warmup: after get_warmup_captions (CLIP done)", doc_id=doc_id, rank=rank
+        )
+        trainable_params = self._configure_trainable_params(model, doc_id=doc_id)
         self._run_warmup_optimization(
             model,
             image,
@@ -645,21 +727,29 @@ class TTWModel:
         args = (context, gen_kwargs, doc_to_visual_fn, doc_id, task, split)
         """
         prepared_model = self._get_prepared_model()
+        rank = getattr(self._base, "rank", 0)
 
-        _log_gpu_memory("generate_until: before state_dict copy")
+        _log_gpu_memory("generate_until: before state_dict copy", rank=rank)
         original_state = self._snapshot_model_state(prepared_model)
-        _log_gpu_memory("generate_until: after state_dict copy to CPU")
+        _log_gpu_memory("generate_until: after state_dict copy to CPU", rank=rank)
         res = []
 
         for req in requests:
             image, task, doc_id = self._get_first_request_image(req)
             if image is not None:
+                gc.collect()
+                torch.cuda.empty_cache()
                 self._ttw_warmup(image, task_name=task, doc_id=doc_id)
+            _log_gpu_memory(
+                "generate_until: after warmup (before inference)", doc_id=doc_id, rank=rank
+            )
 
             single_result = self._generate_single_request_with_fsdp_support(prepared_model, req)
             res.extend(single_result)
+            _log_gpu_memory("generate_until: after inference", doc_id=doc_id, rank=rank)
 
             self._restore_model_state(prepared_model, original_state)
-            _log_gpu_memory("generate_until: after restore")
+            _log_gpu_memory("generate_until: after restore", doc_id=doc_id, rank=rank)
+            torch.cuda.empty_cache()
 
         return res
