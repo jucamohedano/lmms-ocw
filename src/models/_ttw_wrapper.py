@@ -372,20 +372,85 @@ class TTWModel:
         # unsloth returns the model as _model, otherwise self._base.model is the model
         return getattr(self._base, "_model", self._base.model)
 
-    def _snapshot_model_state(self, model):
-        """Snapshot the current model state, preserving local FSDP shards."""
-        state = _fsdp_get_state_dict(model)
+    def _log_snapshot_size(self, state: dict[str, torch.Tensor], label: str) -> None:
+        """Log the CPU snapshot size for TTW restore state."""
         total_bytes = sum(t.numel() * t.element_size() for t in state.values())
         log.info(
-            "TTW snapshot captured: %d tensors (%.2f GiB on this rank)",
+            "TTW %s snapshot captured: %d tensors (%.2f GiB on this rank)",
+            label,
             len(state),
             total_bytes / (1024**3),
         )
+
+    def _snapshot_selected_state(self, model, predicate, label: str) -> dict[str, torch.Tensor]:
+        """Snapshot only the tensors that TTW may mutate for this finetuning mode."""
+        state = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in model.state_dict().items()
+            if predicate(name)
+        }
+        self._log_snapshot_size(state, label)
         return state
 
-    def _restore_model_state(self, model, state) -> None:
-        """Restore the model state from a TTW snapshot."""
-        _fsdp_set_state_dict(model, state)
+    def _snapshot_restore_state(
+        self, model, *, concurrent_lora: bool
+    ) -> tuple[str, dict[str, torch.Tensor]]:
+        """Capture the minimal state needed to restore the model after TTW."""
+        if self.ttw_finetune_method == "full":
+            state = _fsdp_get_state_dict(model)
+            self._log_snapshot_size(state, "full-model")
+            return "full", state
+
+        if self.ttw_finetune_method == "svf":
+            return "partial", self._snapshot_selected_state(
+                model,
+                lambda name: "trainable_svf_S" in name or "visual.merger." in name,
+                "svf",
+            )
+
+        if self.ttw_finetune_method == "lora":
+            if concurrent_lora:
+                log.info("TTW concurrent LoRA restore: no CPU snapshot needed")
+                return "lora_zero", {}
+            return "partial", self._snapshot_selected_state(
+                model,
+                lambda name: "lora_" in name or "visual.merger." in name,
+                "lora",
+            )
+
+        return "partial", {}
+
+    def _restore_selected_state(self, model, state: dict[str, torch.Tensor]) -> None:
+        """Restore a subset of model tensors from CPU snapshots."""
+        if not state:
+            return
+        current_state = model.state_dict()
+        with torch.no_grad():
+            for name, value in state.items():
+                if name in current_state:
+                    current_state[name].copy_(value.to(current_state[name].device))
+
+    def _zero_lora_parameters(self, model) -> None:
+        """Reset LoRA weights to a zero delta between concurrent warmup inferences."""
+        zeroed = 0
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if "lora_" in name:
+                    param.zero_()
+                    zeroed += 1
+        log.debug("Zeroed %d LoRA tensors after concurrent warmup inference", zeroed)
+
+    def _restore_model_state(
+        self, model, restore_mode: str, state: dict[str, torch.Tensor]
+    ) -> None:
+        """Restore the model state from the TTW snapshot/reset strategy."""
+        if restore_mode == "full":
+            _fsdp_set_state_dict(model, state)
+            return
+        if restore_mode == "lora_zero":
+            self._zero_lora_parameters(model)
+            return
+        self._restore_selected_state(model, state)
 
     def __getattr__(self, name):
         """Delegate everything not defined on TTWModel to the base model."""
@@ -1074,9 +1139,13 @@ class TTWModel:
         rank = getattr(self._base, "rank", 0)
         N = self.ttw_concurrent_warmups
 
-        _log_gpu_memory("generate_until: before state_dict copy", rank=rank)
-        original_state = self._snapshot_model_state(prepared_model)
-        _log_gpu_memory("generate_until: after state_dict copy to CPU", rank=rank)
+        concurrent_lora = N > 1 and self.ttw_finetune_method == "lora"
+        _log_gpu_memory("generate_until: before restore-state snapshot", rank=rank)
+        restore_mode, restore_state = self._snapshot_restore_state(
+            prepared_model,
+            concurrent_lora=concurrent_lora,
+        )
+        _log_gpu_memory("generate_until: after restore-state snapshot", rank=rank)
         res = []
 
         if N <= 1:
@@ -1097,7 +1166,7 @@ class TTWModel:
                 res.extend(single_result)
                 _log_gpu_memory("generate_until: after inference", doc_id=doc_id, rank=rank)
 
-                self._restore_model_state(prepared_model, original_state)
+                self._restore_model_state(prepared_model, restore_mode, restore_state)
                 _log_gpu_memory("generate_until: after restore", doc_id=doc_id, rank=rank)
                 torch.cuda.empty_cache()
 
@@ -1178,7 +1247,7 @@ class TTWModel:
                 res.extend(single_result)
                 _log_gpu_memory("generate_until: after inference", doc_id=doc_id, rank=rank)
 
-                self._restore_model_state(prepared_model, original_state)
+                self._restore_model_state(prepared_model, restore_mode, restore_state)
                 _log_gpu_memory("generate_until: after restore", doc_id=doc_id, rank=rank)
                 torch.cuda.empty_cache()
 
