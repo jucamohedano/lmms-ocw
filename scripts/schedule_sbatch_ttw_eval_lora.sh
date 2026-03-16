@@ -9,7 +9,7 @@ num_gpus="${1:-1}"
 if [[ $# -ge 2 ]]; then eval_limit="$2"; else eval_limit="4"; fi
 model="qwen2-vl-7b-ttw"
 limit_suffix="${eval_limit:-full}"
-experiment="ttw_${method}"
+experiment="debug_ttw_${method}"
 wandb_args="${EVAL_WANDB_ARGS:-project=lmms-owc,job_type=eval}"
 # Build --limit arg only when eval_limit is non-empty.
 # When empty, use continuation line (\) so the python command doesn't break.
@@ -74,7 +74,16 @@ export WANDB_MODE=offline
 # Reduce CUDA memory fragmentation
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export UNSLOTH_COMPILE_DISABLE=1
+
+# Unsloth: disable torch.compile on patched kernels (reduces peak VRAM from
+# compiled graph intermediates and avoids compile-cache fragmentation).
+# Probe confirmed Qwen2-VL forward is NOT patched with fused CE loss on
+# Unsloth 2026.3.4 + Transformers 4.57.6; loss goes through standard
+# ForCausalLMLoss. OOM comes from materializing logits + activations for
+# batch_size=5 captions simultaneously.
+# export UNSLOTH_COMPILE_DISABLE=1
+# Diagnostic: Unsloth internal logging to verify loss path at runtime:
+export UNSLOTH_ENABLE_LOGGING=1
 
 # Activate your environment
 source "\$(pwd)"/.venv/bin/activate
@@ -111,6 +120,7 @@ python -m accelerate.commands.launch \\
     --tasks "\${task}" \\
     --output_path "\${EVAL_OUTPUT_DIR}" \\
     --batch_size 1 \\
+    --log_level DEBUG \\
 ${limit_line}
 ${wandb_line}
     --log_samples \\

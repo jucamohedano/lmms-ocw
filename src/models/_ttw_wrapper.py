@@ -14,8 +14,10 @@ Intercepts `generate_until` to:
 """
 import csv
 import gc
+import inspect
 import os
 from datetime import datetime
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -219,6 +221,75 @@ def _ttw_log_loss_to_wandb(
         log.warning("WandB not found, skipping loss logging.")
 
 
+class _TTWVisionDataCollator:
+    """Project-local VLM collator that preserves TTW prompt masking semantics."""
+
+    def __init__(self, processor) -> None:
+        self.processor = processor
+
+    @staticmethod
+    def _prompt_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return the conversation messages up to (but not including) the assistant's response, if present."""
+        if messages and messages[-1].get("role") == "assistant":
+            return messages[:-1]
+        return messages
+
+    @staticmethod
+    def _extract_image(messages: list[dict[str, Any]]) -> Image.Image:
+        """Extract the image from a TTW warmup message list.
+
+        Searches through the message structure to find and return the contained
+        PIL.Image.Image object; raises if no image is present.
+        """
+        for message in messages:
+            for item in message.get("content", []):
+                if item.get("type") == "image" and isinstance(item.get("image"), Image.Image):
+                    return item["image"]
+        raise ValueError("TTW warmup example is missing its image content.")
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        messages_batch = [feature["messages"] for feature in features]
+        images = [self._extract_image(messages) for messages in messages_batch]
+
+        prompt_texts = [
+            self.processor.apply_chat_template(
+                self._prompt_messages(messages),
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for messages in messages_batch
+        ]
+        prompt_tokens = self.processor(
+            text=prompt_texts,
+            images=images,
+            return_tensors="pt",
+            padding=True,
+        )
+        prompt_lens = prompt_tokens.attention_mask.sum(dim=1).tolist()
+
+        full_texts = [
+            self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            for messages in messages_batch
+        ]
+        batch = self.processor(
+            text=full_texts,
+            images=images,
+            return_tensors="pt",
+            padding=True,
+        )
+
+        labels = batch["input_ids"].clone()
+        labels[batch["attention_mask"] == 0] = -100
+        for row, prompt_len in enumerate(prompt_lens):
+            labels[row, : int(prompt_len)] = -100
+        batch["labels"] = labels
+        return batch
+
+
 class TTWModel:
     """Wraps any Model to add Test-Time Warmup"""
 
@@ -265,18 +336,19 @@ class TTWModel:
         # For SVF, the base model stores _svf_layers for warmup.
         self._svf_layers = getattr(self._base, "_svf_layers", None)
 
-    def _unfreeze_connector(self, model) -> None:
-        """Unfreeze the vision-language connector (guaranteed in our multimodal setups)."""
+    def _get_connector_owner(self, model):
+        """Return the model object that owns visual.merger (connector)."""
         if hasattr(model, "module"):
             model = model.module
-        connector_owner = model
         if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
-            # PEFT-wrapped path
-            connector_owner = model.base_model.model
-        elif hasattr(model, "model"):
-            # Base Qwen2-VL path
-            connector_owner = model.model
+            return model.base_model.model
+        if hasattr(model, "model"):
+            return model.model
+        return model
 
+    def _unfreeze_connector(self, model) -> None:
+        """Unfreeze the vision-language connector (guaranteed in our multimodal setups)."""
+        connector_owner = self._get_connector_owner(model)
         # TODO: change for other models, this is qwen2-vl specific
         for param in connector_owner.visual.merger.parameters():
             param.requires_grad = True
@@ -435,6 +507,15 @@ class TTWModel:
                 if "lora_" in name:
                     param.requires_grad = True
             self._unfreeze_connector(model)
+            if self.ttw_lora_backend == "unsloth":
+                connector_owner = self._get_connector_owner(model)
+                merger_params = list(connector_owner.visual.merger.parameters())
+                connector_trainable = any(p.requires_grad for p in merger_params)
+                log.info(
+                    "LoRA Unsloth: connector (visual.merger) trainable=%s (%d params)",
+                    connector_trainable,
+                    len(merger_params),
+                )
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             log.debug(f"LoRA: {sum(p.numel() for p in trainable_params):,} trainable params")
         elif self.ttw_finetune_method == "full":
@@ -471,6 +552,183 @@ class TTWModel:
         if hasattr(model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable()
 
+    def _get_warmup_training_model(self):
+        """Use the raw model for trainer-managed LoRA warmup."""
+        if self.ttw_finetune_method == "lora":
+            return self._base.model
+        return self._get_prepared_model()
+
+    def _build_warmup_training_dataset(
+        self,
+        image: Image.Image,
+        warmup_captions: list[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        """Convert TTW caption pairs into trainer-ready chat examples."""
+        return [
+            {"messages": self._base.ttw_format_chat(image, prompt_text, caption_text)}
+            for prompt_text, caption_text in warmup_captions
+        ]
+
+    def _build_trainer_config(self, output_dir: str, model_dtype):
+        """Build TRL SFTConfig for TTW warmup.
+
+        Uses a minimal config for PEFT (matches original TTW: plain AdamW).
+        Adds Unsloth-specific args only when ttw_lora_backend == "unsloth".
+        """
+        try:
+            from trl import SFTConfig
+        except ImportError as exc:
+            raise ImportError(
+                "TTW trainer warmup requires TRL. Install it with `pip install trl`."
+            ) from exc
+
+        bf16_enabled = model_dtype == torch.bfloat16
+        fp16_enabled = model_dtype == torch.float16
+        config_kwargs = {
+            "output_dir": output_dir,
+            "num_train_epochs": self.ttw_epochs,
+            "per_device_train_batch_size": 1,
+            "gradient_accumulation_steps": self.ttw_batch_size,
+            "gradient_checkpointing": True,
+            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+            "learning_rate": self.ttw_lr,
+            "weight_decay": 0.0,
+            "bf16": bf16_enabled,
+            "fp16": fp16_enabled,
+            "logging_strategy": "steps",
+            "logging_steps": 1,
+            "save_strategy": "no",
+            "report_to": "none",
+            "disable_tqdm": True,
+            "remove_unused_columns": False,
+            "dataset_text_field": "",
+            "dataset_kwargs": {"skip_prepare_dataset": True},
+            "dataloader_num_workers": 8,
+            "max_length": None,
+            # PEFT: plain AdamW (matches original TTW authors)
+            "optim": "adamw_torch",
+        }
+        if self.ttw_lora_backend == "unsloth":
+            config_kwargs.update(
+                {
+                    "optim": "adamw_torch_fused",
+                    "average_tokens_across_devices": False,
+                }
+            )
+        return SFTConfig(**config_kwargs)
+
+    def _build_trainer_kwargs(
+        self, trainer_class, model, processor, collator, train_dataset, config
+    ):
+        """Support TRL versions that renamed tokenizer -> processing_class."""
+        trainer_kwargs = {
+            "model": model,
+            "train_dataset": train_dataset,
+            "data_collator": collator,
+            "args": config,
+        }
+        init_params = inspect.signature(trainer_class.__init__).parameters
+        if "processing_class" in init_params:
+            trainer_kwargs["processing_class"] = processor
+        elif "tokenizer" in init_params:
+            trainer_kwargs["tokenizer"] = processor
+        return trainer_kwargs
+
+    def _get_unsloth_response_templates(self) -> tuple[str, str] | None:
+        """Return assistant boundary markers for Unsloth response-only masking."""
+        model_name = str(getattr(self._base, "_model_name_or_path", ""))
+        if "Qwen" in model_name:
+            return "<|im_start|>user\n", "<|im_start|>assistant\n"
+        return None
+
+    def _run_trainer_warmup_optimization(
+        self,
+        model,
+        image: Image.Image,
+        warmup_captions,
+        doc_id: int | None = None,
+    ) -> None:
+        """Run TTW warmup through TRL instead of a hand-written loop."""
+        try:
+            from trl import SFTTrainer
+        except ImportError as exc:
+            raise ImportError(
+                "TTW trainer warmup requires TRL. Install it with `pip install trl`."
+            ) from exc
+
+        processor = self._base.processor
+        rank = getattr(self._base, "rank", 0)
+        world_size = getattr(self._base, "world_size", 1)
+        device = next(model.parameters()).device
+        model_dtype = getattr(self._base.model, "dtype", torch.bfloat16)
+        train_dataset = self._build_warmup_training_dataset(image, warmup_captions)
+        output_dir = os.path.join("logs", "ttw_trainer", f"rank{rank}")
+        os.makedirs(output_dir, exist_ok=True)
+
+        if self.ttw_lora_backend == "unsloth":
+            try:
+                from unsloth import FastVisionModel, unsloth_train
+                from unsloth.trainer import UnslothVisionDataCollator
+            except ImportError as exc:
+                raise ImportError("TTW unsloth warmup requires the `unsloth` package.") from exc
+
+            FastVisionModel.for_training(model)
+            response_templates = self._get_unsloth_response_templates()
+            collator_kwargs = {"completion_only_loss": True}
+            if response_templates is not None:
+                instruction_part, response_part = response_templates
+                collator_kwargs.update(
+                    {
+                        "train_on_responses_only": True,
+                        "instruction_part": instruction_part,
+                        "response_part": response_part,
+                    }
+                )
+            collator = UnslothVisionDataCollator(model, processor, **collator_kwargs)
+        else:
+            collator = _TTWVisionDataCollator(processor)
+
+        config = self._build_trainer_config(output_dir, model_dtype)
+        trainer_kwargs = self._build_trainer_kwargs(
+            SFTTrainer,
+            model,
+            processor,
+            collator,
+            train_dataset,
+            config,
+        )
+
+        model.train()
+        _log_gpu_memory("TTW warmup: before trainer.train", doc_id=doc_id, rank=rank)
+
+        trainer = SFTTrainer(**trainer_kwargs)
+        try:
+            with torch.enable_grad():
+                if self.ttw_lora_backend == "unsloth":
+                    train_result = unsloth_train(trainer)
+                else:
+                    train_result = trainer.train()
+            if hasattr(train_result, "training_loss"):
+                global_step = getattr(self, "_ttw_wandb_step", 0)
+                _ttw_log_loss_to_wandb(
+                    float(train_result.training_loss),
+                    rank,
+                    world_size,
+                    global_step,
+                    device=device,
+                )
+                self._ttw_wandb_step = global_step + 1
+            _log_gpu_memory("TTW warmup: after trainer.train", doc_id=doc_id, rank=rank)
+        finally:
+            del trainer
+
+        self._disable_gradient_checkpointing(model)
+        model.eval()
+        torch.cuda.empty_cache()
+        self._set_requires_grad(model, False)
+        _log_gpu_memory("TTW warmup: done", doc_id=doc_id, rank=rank)
+        log.info("TTW warmup finished.")
+
     def _run_warmup_optimization(
         self,
         model,
@@ -481,6 +739,15 @@ class TTWModel:
         doc_id: int | None = None,
     ):
         """Run the TTW optimization loop for a single image."""
+        if self.ttw_finetune_method == "lora" and self.ttw_lora_backend in {"unsloth", "peft"}:
+            self._run_trainer_warmup_optimization(
+                model,
+                image,
+                warmup_captions,
+                doc_id=doc_id,
+            )
+            return
+
         optimizer = AdamW(trainable_params, lr=self.ttw_lr, foreach=False)
 
         log.info(
@@ -499,7 +766,6 @@ class TTWModel:
 
         device = next(model.parameters()).device
         world_size = getattr(self._base, "world_size", 1)
-
         use_grad_accum = self.ttw_grad_accum
         with torch.enable_grad(), torch.autocast("cuda", dtype=model_dtype):
             for epoch in range(self.ttw_epochs):
@@ -566,7 +832,7 @@ class TTWModel:
 
     def _ttw_warmup(self, image: Image.Image, task_name: str = None, doc_id: int = None):
         """Run TTW warmup: fetch captions, configure trainables, and optimize."""
-        model = self._get_prepared_model()
+        model = self._get_warmup_training_model()
         log.info("Starting TTW Warmup for new image...")
 
         warmup_captions = self._get_warmup_captions(image, task_name=task_name, doc_id=doc_id)

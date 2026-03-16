@@ -226,6 +226,7 @@ class Qwen2VL(Model):
             if use_fsdp and backend == "unsloth":
                 log.info("Unsloth requested but FSDP detected; applying PEFT LoRA instead.")
                 backend = "peft"
+            self._ttw_lora_backend = backend
             if backend == "unsloth":
                 self._apply_lora_unsloth()
             else:
@@ -262,6 +263,8 @@ class Qwen2VL(Model):
             bias="none",
             task_type=TaskType.CAUSAL_LM,
         )
+        if hasattr(self._model, "enable_input_require_grads"):
+            self._model.enable_input_require_grads()
         self._model = get_peft_model(self._model, lora_config)
         log.info("Applied PEFT LoRA adapters before FSDP prepare.")
 
@@ -274,10 +277,13 @@ class Qwen2VL(Model):
                 "Unsloth requested for TTW LoRA but package not available. "
                 "Falling back to PEFT."
             )
+            self._ttw_lora_backend = "peft"
             self._apply_lora_peft()
             return
 
         try:
+            if hasattr(self._model, "enable_input_require_grads"):
+                self._model.enable_input_require_grads()
             self._model = FastVisionModel.get_peft_model(
                 self._model,
                 finetune_vision_layers=False,
@@ -303,6 +309,7 @@ class Qwen2VL(Model):
             log.info("Applied Unsloth LoRA adapters (single-GPU path).")
         except Exception as exc:
             log.warning("Failed to apply Unsloth LoRA; falling back to PEFT. Reason: %s", exc)
+            self._ttw_lora_backend = "peft"
             self._apply_lora_peft()
 
     def _log_conversation(self, conversation: list) -> None:
