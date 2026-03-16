@@ -9,7 +9,7 @@ num_gpus="${1:-1}"
 if [[ $# -ge 2 ]]; then eval_limit="$2"; else eval_limit="4"; fi
 model="qwen2-vl-7b-ttw"
 limit_suffix="${eval_limit:-full}"
-experiment="debug_ttw_${method}"
+experiment="debug_ttw_peft_test_concurrent_${method}"
 wandb_args="${EVAL_WANDB_ARGS:-project=lmms-owc,job_type=eval}"
 # Build --limit arg only when eval_limit is non-empty.
 # When empty, use continuation line (\) so the python command doesn't break.
@@ -83,7 +83,21 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # batch_size=5 captions simultaneously.
 # export UNSLOTH_COMPILE_DISABLE=1
 # Diagnostic: Unsloth internal logging to verify loss path at runtime:
-export UNSLOTH_ENABLE_LOGGING=1
+# export UNSLOTH_ENABLE_LOGGING=1
+
+# ── CUDA MPS for concurrent TTW warmup workers ──
+export CUDA_MPS_PIPE_DIRECTORY=logs/nvidia-mps-\${SLURM_JOB_ID}
+export CUDA_MPS_LOG_DIRECTORY=logs/nvidia-mps-log-\${SLURM_JOB_ID}
+mkdir -p \${CUDA_MPS_PIPE_DIRECTORY} \${CUDA_MPS_LOG_DIRECTORY}
+nvidia-cuda-mps-control -d
+echo "CUDA MPS daemon started"
+
+cleanup_mps() {
+    echo quit | nvidia-cuda-mps-control 2>/dev/null || true
+    rm -rf \${CUDA_MPS_PIPE_DIRECTORY} \${CUDA_MPS_LOG_DIRECTORY}
+    echo "CUDA MPS daemon stopped"
+}
+trap cleanup_mps EXIT
 
 # Activate your environment
 source "\$(pwd)"/.venv/bin/activate
@@ -116,7 +130,7 @@ python -m accelerate.commands.launch \\
     --mixed_precision=bf16 \\
     -m eval_model \\
     --model ${model} \\
-    --model_args offline_caption_dir=./offline_captions/,ttw_finetune_method=${method},ttw_lora_backend=unsloth,ttw_lr=1e-4,ttw_epochs=5 \\
+    --model_args offline_caption_dir=./offline_captions/,ttw_finetune_method=${method},ttw_lora_backend=peft,ttw_lr=1e-4,ttw_epochs=5,ttw_concurrent_warmups=2 \\
     --tasks "\${task}" \\
     --output_path "\${EVAL_OUTPUT_DIR}" \\
     --batch_size 1 \\

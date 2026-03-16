@@ -2367,6 +2367,7 @@ def qwen2_vl_2b_ttw(**model_kwargs) -> Model:
     ttw_lora_backend = model_kwargs.pop("ttw_lora_backend", "peft")
     ttw_svf_rank = model_kwargs.pop("ttw_svf_rank", -1)
     ttw_grad_accum = model_kwargs.pop("ttw_grad_accum", False)
+    ttw_concurrent_warmups = model_kwargs.pop("ttw_concurrent_warmups", 1)
     base = Qwen2VL(
         model_name_or_path,
         compile=False,
@@ -2390,6 +2391,7 @@ def qwen2_vl_2b_ttw(**model_kwargs) -> Model:
         ttw_lora_backend=ttw_lora_backend,
         ttw_svf_rank=ttw_svf_rank,
         ttw_grad_accum=ttw_grad_accum,
+        ttw_concurrent_warmups=ttw_concurrent_warmups,
     )
 
 
@@ -2410,6 +2412,7 @@ def qwen2_vl_7b_ttw(**model_kwargs) -> Model:
     ttw_svf_rank = model_kwargs.pop("ttw_svf_rank", -1)
     ttw_compile = model_kwargs.pop("ttw_compile", False)
     ttw_grad_accum = model_kwargs.pop("ttw_grad_accum", False)
+    ttw_concurrent_warmups = model_kwargs.pop("ttw_concurrent_warmups", 1)
     base = Qwen2VL(
         model_name_or_path,
         compile=ttw_compile,
@@ -2433,4 +2436,5 @@ def qwen2_vl_7b_ttw(**model_kwargs) -> Model:
         ttw_lora_backend=ttw_lora_backend,
         ttw_svf_rank=ttw_svf_rank,
         ttw_grad_accum=ttw_grad_accum,
+        ttw_concurrent_warmups=ttw_concurrent_warmups,
     )

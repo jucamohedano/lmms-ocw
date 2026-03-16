@@ -126,7 +126,12 @@ def _ensure_gpu_csv_open(rank: int) -> None:
     log_dir = "logs/gpu"
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(log_dir, f"ttw_gpu_memory_{timestamp}_rank{rank}.csv")
+    job_name = os.environ.get("SLURM_JOB_NAME", "local")
+    job_safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in job_name)
+    if job_safe:
+        path = os.path.join(log_dir, f"ttw_gpu_memory_{job_safe}_{timestamp}_rank{rank}.csv")
+    else:
+        path = os.path.join(log_dir, f"ttw_gpu_memory_{timestamp}_rank{rank}.csv")
     _gpu_csv_file = open(path, "w", newline="", encoding="utf-8")
     _gpu_csv_writer = csv.writer(_gpu_csv_file)
     _gpu_csv_writer.writerow(
@@ -314,6 +319,7 @@ class TTWModel:
         ttw_lora_backend="peft",  # "peft" or "unsloth"
         ttw_svf_rank=-1,  # SVD truncation rank (-1 = full)
         ttw_grad_accum=False,  # micro-batch gradient accumulation (fallback for OOM)
+        ttw_concurrent_warmups=1,  # >1 enables ProcessPool workers (requires MPS)
     ):
         self._base = base_model
         self.ttw_lr = ttw_lr
@@ -331,6 +337,8 @@ class TTWModel:
         self.ttw_lora_backend = ttw_lora_backend
         self.ttw_svf_rank = ttw_svf_rank
         self.ttw_grad_accum = ttw_grad_accum
+        self.ttw_concurrent_warmups = int(ttw_concurrent_warmups)
+        self._warmup_pool = None
 
         # SVF and LoRA are applied in Qwen2VL._transform_model_before_prepare (before FSDP).
         # For SVF, the base model stores _svf_layers for warmup.
@@ -983,39 +991,195 @@ class TTWModel:
 
         return batch
 
+    # ── Concurrent warmup pool helpers ─────────────────────────────────────
+
+    @staticmethod
+    def _get_lora_config_dict() -> dict[str, Any]:
+        """Return the LoRA config as a plain dict (must match _apply_lora_peft)."""
+        from peft import TaskType
+
+        return {
+            "r": 16,
+            "lora_alpha": 32,
+            "target_modules": [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            "lora_dropout": 0.05,
+            "bias": "none",
+            "task_type": TaskType.CAUSAL_LM,
+        }
+
+    def _get_warmup_pool(self):
+        """Lazily create the ProcessPool with persistent workers."""
+        if self._warmup_pool is None:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+
+            from src.models._ttw_peft_warmup import _init_worker
+
+            ctx = mp.get_context("spawn")
+            model_path = self._base._model_name_or_path
+            lora_cfg = self._get_lora_config_dict()
+            gpu_id = getattr(
+                getattr(self._base, "accelerator", None),
+                "local_process_index",
+                0,
+            )
+            self._warmup_pool = ProcessPoolExecutor(
+                max_workers=self.ttw_concurrent_warmups,
+                mp_context=ctx,
+                initializer=_init_worker,
+                initargs=(model_path, lora_cfg, "bfloat16", gpu_id),
+            )
+            log.info(
+                "Created warmup ProcessPool with %d workers for model %s",
+                self.ttw_concurrent_warmups,
+                model_path,
+            )
+        return self._warmup_pool
+
+    def _merge_adapter(self, model, adapter_state: dict[str, torch.Tensor]) -> None:
+        """Load warmup worker's LoRA weights into the main process model."""
+        device = next(model.parameters()).device
+        current_state = model.state_dict()
+        loaded = 0
+        for k, v in adapter_state.items():
+            if k in current_state:
+                current_state[k].copy_(v.to(device))
+                loaded += 1
+        log.debug("Merged %d LoRA keys from worker into main model", loaded)
+
+    # ── generate_until ───────────────────────────────────────────────────
+
     def generate_until(self, requests):
         """Intercept: warmup → delegate → restore.
 
         TTW adapts per-image, so we process one request at a time:
         save weights → warmup on image → infer → restore weights.
 
+        When ``ttw_concurrent_warmups > 1``, warmup is offloaded to a
+        ``ProcessPoolExecutor`` (persistent workers, one model each) so that
+        multiple images warm up concurrently on the same GPU via MPS.
+
         Images are extracted via the doc_to_visual mechanism in TaskInstance.args:
         args = (context, gen_kwargs, doc_to_visual_fn, doc_id, task, split)
         """
         prepared_model = self._get_prepared_model()
         rank = getattr(self._base, "rank", 0)
+        N = self.ttw_concurrent_warmups
 
         _log_gpu_memory("generate_until: before state_dict copy", rank=rank)
         original_state = self._snapshot_model_state(prepared_model)
         _log_gpu_memory("generate_until: after state_dict copy to CPU", rank=rank)
         res = []
 
-        for req in requests:
-            image, task, doc_id = self._get_first_request_image(req)
-            if image is not None:
-                gc.collect()
+        if N <= 1:
+            # Sequential path (unchanged)
+            for req in requests:
+                image, task, doc_id = self._get_first_request_image(req)
+                if image is not None:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    self._ttw_warmup(image, task_name=task, doc_id=doc_id)
+                _log_gpu_memory(
+                    "generate_until: after warmup (before inference)", doc_id=doc_id, rank=rank
+                )
+
+                single_result = self._generate_single_request_with_fsdp_support(
+                    prepared_model, req
+                )
+                res.extend(single_result)
+                _log_gpu_memory("generate_until: after inference", doc_id=doc_id, rank=rank)
+
+                self._restore_model_state(prepared_model, original_state)
+                _log_gpu_memory("generate_until: after restore", doc_id=doc_id, rank=rank)
                 torch.cuda.empty_cache()
-                self._ttw_warmup(image, task_name=task, doc_id=doc_id)
-            _log_gpu_memory(
-                "generate_until: after warmup (before inference)", doc_id=doc_id, rank=rank
-            )
 
-            single_result = self._generate_single_request_with_fsdp_support(prepared_model, req)
-            res.extend(single_result)
-            _log_gpu_memory("generate_until: after inference", doc_id=doc_id, rank=rank)
+            return res
 
-            self._restore_model_state(prepared_model, original_state)
-            _log_gpu_memory("generate_until: after restore", doc_id=doc_id, rank=rank)
-            torch.cuda.empty_cache()
+        # Concurrent path — batch requests into groups of N
+        from src.models._ttw_peft_warmup import run_warmup, serialize_image
+
+        pool = self._get_warmup_pool()
+        log.info(
+            "Concurrent TTW: processing %d requests in batches of %d",
+            len(requests),
+            N,
+        )
+
+        for i in range(0, len(requests), N):
+            batch = requests[i : i + N]
+
+            # 1. Prepare: extract images + captions (main process, CPU)
+            items: list[tuple[bytes, list[tuple[str, str]], int | None]] = []
+            for req in batch:
+                image, task, doc_id = self._get_first_request_image(req)
+                if image is not None:
+                    captions = self._get_warmup_captions(
+                        image,
+                        task_name=task,
+                        doc_id=doc_id,
+                    )
+                    image_bytes = serialize_image(image)
+                    items.append((image_bytes, captions, doc_id))
+                else:
+                    items.append((None, [], doc_id))
+
+            # 2. Offload DDP model to CPU — currently disabled.
+            # Kept here for reference in case we want to revisit it later.
+            # gpu_device = next(prepared_model.parameters()).device
+            # _log_gpu_memory("generate_until: before DDP offload to CPU", rank=rank)
+            # prepared_model.to("cpu")
+            # torch.cuda.empty_cache()
+            # _log_gpu_memory("generate_until: after DDP offload to CPU", rank=rank)
+
+            # 3. Warmup: submit to pool (concurrent on same GPU via MPS)
+            futures = []
+            for img_b, caps, _ in items:
+                if img_b is not None and caps:
+                    futures.append(
+                        pool.submit(
+                            run_warmup,
+                            img_b,
+                            caps,
+                            self.ttw_epochs,
+                            self.ttw_lr,
+                            self.ttw_batch_size,
+                        )
+                    )
+                else:
+                    futures.append(None)
+
+            adapter_states = [f.result() if f is not None else None for f in futures]
+
+            # 4. Bring DDP model back to GPU for inference
+            # prepared_model.to(gpu_device)
+            # _log_gpu_memory("generate_until: after DDP reload to GPU", rank=rank)
+
+            # 5. Infer: sequential on main process (DDP model)
+            for req, adapter_state, (_, _, doc_id) in zip(batch, adapter_states, items):
+                if adapter_state is not None:
+                    self._merge_adapter(prepared_model, adapter_state)
+                _log_gpu_memory(
+                    "generate_until: after warmup (before inference)",
+                    doc_id=doc_id,
+                    rank=rank,
+                )
+
+                single_result = self._generate_single_request_with_fsdp_support(
+                    prepared_model, req
+                )
+                res.extend(single_result)
+                _log_gpu_memory("generate_until: after inference", doc_id=doc_id, rank=rank)
+
+                self._restore_model_state(prepared_model, original_state)
+                _log_gpu_memory("generate_until: after restore", doc_id=doc_id, rank=rank)
+                torch.cuda.empty_cache()
 
         return res
