@@ -16,6 +16,8 @@ import csv
 import gc
 import inspect
 import os
+import shutil
+import subprocess
 from datetime import datetime
 from typing import Any
 
@@ -144,10 +146,35 @@ def _ensure_gpu_csv_open(rank: int) -> None:
             "alloc_gib",
             "reserved_gib",
             "total_gib",
+            "total_gpu_used_gib",
         ]
     )
     _gpu_csv_file.flush()
     log.info("GPU memory CSV: %s", path)
+
+
+def _get_total_gpu_memory_gib() -> list[float] | None:
+    """Get total used memory per GPU (all processes) via nvidia-smi. Returns None on failure."""
+    try:
+        nvidia_smi = shutil.which("nvidia-smi")
+        if not nvidia_smi:
+            return None
+        out = subprocess.run(
+            [
+                nvidia_smi,
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode != 0:
+            return None
+        # memory.used is in MiB
+        return [float(x.strip()) / 1024 for x in out.stdout.strip().split("\n") if x.strip()]
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        return None
 
 
 def _log_gpu_memory(
@@ -155,25 +182,47 @@ def _log_gpu_memory(
     doc_id: int | None = None,
     rank: int | None = None,
 ) -> None:
-    """Log per-GPU memory for debugging OOM issues. Optionally append to CSV in logs/gpu/."""
+    """Log per-GPU memory for debugging OOM issues. Optionally append to CSV in logs/gpu/.
+
+    Uses nvidia-smi for total GPU usage (all processes) when available, so concurrent
+    TTW worker memory is included. Falls back to torch.cuda.memory_allocated (main
+    process only) otherwise.
+    """
     if not torch.cuda.is_available():
         return
     r = rank if rank is not None else (dist.get_rank() if dist.is_initialized() else 0)
     ts = datetime.now().isoformat()
-    for i in range(torch.cuda.device_count()):
+    total_gpu_per_device = _get_total_gpu_memory_gib()
+    n_devices = torch.cuda.device_count()
+    for i in range(n_devices):
         alloc = torch.cuda.memory_allocated(i) / (1024**3)
         reserved = torch.cuda.memory_reserved(i) / (1024**3)
         total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
-        log.info(
-            "[Rank %d GPU %d] %s: %.2f/%.2f GiB allocated (%.2f GiB reserved)",
-            r,
-            i,
-            label,
-            alloc,
-            total,
-            reserved,
+        total_used = (
+            total_gpu_per_device[i]
+            if total_gpu_per_device and i < len(total_gpu_per_device)
+            else None
         )
-        # Append to CSV for later analysis
+        if total_used is not None:
+            log.info(
+                "[Rank %d GPU %d] %s: %.2f/%.2f GiB total GPU (%.2f this process)",
+                r,
+                i,
+                label,
+                total_used,
+                total,
+                alloc,
+            )
+        else:
+            log.info(
+                "[Rank %d GPU %d] %s: %.2f/%.2f GiB allocated (%.2f GiB reserved)",
+                r,
+                i,
+                label,
+                alloc,
+                total,
+                reserved,
+            )
         try:
             _ensure_gpu_csv_open(r)
             _gpu_csv_writer.writerow(
@@ -186,6 +235,7 @@ def _log_gpu_memory(
                     f"{alloc:.2f}",
                     f"{reserved:.2f}",
                     f"{total:.2f}",
+                    f"{total_used:.2f}" if total_used is not None else "",
                 ]
             )
             _gpu_csv_file.flush()
@@ -1209,6 +1259,8 @@ class TTWModel:
             # _log_gpu_memory("generate_until: after DDP offload to CPU", rank=rank)
 
             # 3. Warmup: submit to pool (concurrent on same GPU via MPS)
+            from concurrent.futures import wait, FIRST_COMPLETED
+
             futures = []
             for img_b, caps, _ in items:
                 if img_b is not None and caps:
@@ -1220,10 +1272,24 @@ class TTWModel:
                             self.ttw_epochs,
                             self.ttw_lr,
                             self.ttw_batch_size,
+                            self.ttw_grad_accum,
                         )
                     )
                 else:
                     futures.append(None)
+
+            # Sample GPU memory periodically during warmup (captures main + workers)
+            pending = {f for f in futures if f is not None}
+            sample_n = 0
+            while pending:
+                done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+                if pending and _get_total_gpu_memory_gib() is not None:
+                    sample_n += 1
+                    _log_gpu_memory(
+                        f"concurrent warmup: sampling #{sample_n}",
+                        doc_id=items[0][2] if items else None,
+                        rank=rank,
+                    )
 
             adapter_states = [f.result() if f is not None else None for f in futures]
 
