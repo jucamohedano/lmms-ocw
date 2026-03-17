@@ -100,10 +100,22 @@ def run_warmup(
     epochs: int,
     lr: float,
     batch_size: int,
+    grad_accum: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Train LoRA on one image and return adapter state dict on CPU.
 
     Called per image from the main process via ``pool.submit``.
+
+    Args:
+    ----
+        image_bytes: The serialized image bytes.
+        warmup_captions: The list of warmup captions.
+        epochs: The number of epochs to train for.
+        lr: The learning rate to use for training.
+        batch_size: The batch size to use for training.
+        grad_accum: If True, process one caption per forward (low VRAM). If False,
+            process batch_size captions in one forward (faster, higher VRAM).
+
     """
     global _worker_model, _worker_processor, _worker_initial_lora_state
     global _worker_liger_loss_fn
@@ -126,42 +138,30 @@ def run_warmup(
         for _ in range(epochs):
             for start in range(0, len(warmup_captions), batch_size):
                 batch_captions = warmup_captions[start : start + batch_size]
-                # Pre-compute total non-padding tokens for token-weighted loss.
-                total_tokens = sum(
-                    (_build_training_batch(processor, image, [cp], device)["labels"] != -100)
+                total_tokens = (
+                    (
+                        _build_training_batch(processor, image, batch_captions, device)["labels"]
+                        != -100
+                    )
                     .sum()
                     .item()
-                    for cp in batch_captions
                 )
                 if total_tokens == 0:
                     continue
                 lm_head = model.get_output_embeddings()
-                # Gradient accumulation: one caption at a time to keep peak VRAM low.
-                for caption_pair in batch_captions:
-                    micro_batch = _build_training_batch(
-                        processor,
-                        image,
-                        [caption_pair],
-                        device,
-                    )
-                    # Get last hidden state and let Liger fuse lm_head + CE without
-                    # materializing the full [seq, vocab] logits tensor.
-                    batch_for_forward = {k: v for k, v in micro_batch.items() if k != "labels"}
-                    outputs = model(
-                        **batch_for_forward,
-                        output_hidden_states=True,
-                        use_cache=False,
-                    )
-                    hidden = outputs.hidden_states[-1]
-                    shift_hidden = hidden[..., :-1, :].contiguous().view(-1, hidden.shape[-1])
-                    shift_labels = micro_batch["labels"][..., 1:].contiguous().view(-1)
-                    loss = _worker_liger_loss_fn(
-                        lm_head.weight,
-                        shift_hidden,
-                        shift_labels,
-                    )
-                    loss = loss / total_tokens
-                    loss.backward()
+
+                if grad_accum:
+                    # One caption per forward to keep peak VRAM low.
+                    for caption_pair in batch_captions:
+                        micro_batch = _build_training_batch(
+                            processor, image, [caption_pair], device
+                        )
+                        _forward_and_backward(model, micro_batch, lm_head, total_tokens)
+                else:
+                    # Full batch in one forward (batch_size captions, no grad accum).
+                    batch = _build_training_batch(processor, image, batch_captions, device)
+                    _forward_and_backward(model, batch, lm_head, total_tokens)
+
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
@@ -172,6 +172,27 @@ def run_warmup(
 
     adapter_state = {k: v.cpu() for k, v in model.state_dict().items() if "lora_" in k}
     return adapter_state
+
+
+def _forward_and_backward(
+    model: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    lm_head: torch.nn.Module,
+    total_tokens: int,
+) -> None:
+    """Run one forward + backward with Liger fused CE (no full logits)."""
+    batch_for_forward = {k: v for k, v in batch.items() if k != "labels"}
+    outputs = model(
+        **batch_for_forward,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    hidden = outputs.hidden_states[-1]
+    shift_hidden = hidden[..., :-1, :].contiguous().view(-1, hidden.shape[-1])
+    shift_labels = batch["labels"][..., 1:].contiguous().view(-1)
+    loss = _worker_liger_loss_fn(lm_head.weight, shift_hidden, shift_labels)
+    loss = loss / total_tokens
+    loss.backward()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
