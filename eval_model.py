@@ -333,6 +333,7 @@ def main(args: argparse.Namespace) -> None:
             "ttw_caption_temperature",
             "ttw_max_new_tokens",
             "ttw_grad_accum",
+            "ttw_concurrent_warmups",
         ]
         for key in ttw_keys:
             if key in model_args_parsed:
