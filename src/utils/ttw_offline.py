@@ -11,8 +11,10 @@ so the resulting files are interchangeable.
 
 import json
 import os
+from pathlib import Path
 
 import torch
+from huggingface_hub import HfApi, create_repo
 from PIL import Image
 
 from src import utils
@@ -293,4 +295,125 @@ def generate_offline_captions(args, task_manager, task_names):
     else:
         backend = _make_hf_backend(args)
 
-    return _run_offline_loop(args, task_manager, task_names, backend)
+    result = _run_offline_loop(args, task_manager, task_names, backend)
+
+    # Upload to HuggingFace if requested
+    if getattr(args, "ttw_upload_to_hf", False):
+        hf_token = args.hf_token or os.environ.get("HF_TOKEN")
+        if not hf_token:
+            raise ValueError(
+                "You must provide --hf_token or set HF_TOKEN environment variable "
+                "when using --ttw_upload_to_hf"
+            )
+        upload_offline_captions_to_hf(
+            hf_token=hf_token,
+            output_path=args.output_path,
+            repo_name=args.hf_repo_name,
+            model_name=args.model,
+            commit_message=args.hf_commit_message,
+            private=args.hf_private_repo,
+        )
+
+    return result
+
+
+def upload_offline_captions_to_hf(
+    hf_token: str,
+    output_path: str,
+    repo_name: str | None = None,
+    model_name: str | None = None,
+    commit_message: str | None = None,
+    private: bool = True,
+    repo_type: str = "dataset",
+    namespace: str = "ttw-captions",
+) -> str:
+    """Upload TTW offline caption datasets to HuggingFace as a dataset repository.
+
+    Args:
+        hf_token: HuggingFace authentication token with write permissions.
+        output_path: Local directory containing the generated JSONL caption files.
+        repo_name: HuggingFace repository name (e.g., "username/dataset-name").
+                  If None, generates a name based on model_name or infers from filenames.
+        model_name: Model identifier (used to generate repo_name if not provided).
+        commit_message: Custom commit message for the upload.
+        private: Whether to create the repository as private. Default: True.
+        repo_type: Repository type, either "dataset" or "model". Default: "dataset".
+        namespace: HuggingFace namespace/username to use when repo_name is auto-generated.
+                  Default: "ttw-captions".
+
+    Returns:
+        The URL of the created/updated HuggingFace repository.
+
+    Raises:
+        ValueError: If output_path doesn't exist or repo_name cannot be determined.
+    """
+    output_path = Path(output_path)
+
+    if not output_path.exists():
+        raise ValueError(f"Output path does not exist: {output_path}")
+
+    # Find all JSONL files in the output directory
+    jsonl_files = list(output_path.glob("*.jsonl"))
+    if not jsonl_files:
+        raise ValueError(f"No JSONL files found in {output_path}")
+
+    # Determine repository name
+    if repo_name is None:
+        if model_name is None:
+            # Try to infer from first JSONL filename
+            first_file = jsonl_files[0]
+            # Extract model part from filename (format: modelid_task_captions.jsonl)
+            stem = first_file.stem
+            parts = stem.split("_")
+            if len(parts) >= 2:
+                model_part = parts[0]
+            else:
+                model_part = "ttw-captions"
+            repo_name = f"{namespace}/{model_part}"
+        else:
+            safe_model_name = model_name.replace("/", "--")
+            repo_name = f"{namespace}/{safe_model_name}"
+
+    log.info(f"Uploading {len(jsonl_files)} JSONL files to HuggingFace repo: {repo_name}")
+    log.info(f"Repository type: {repo_type}, Private: {private}")
+
+    # Initialize HuggingFace API
+    api = HfApi(token=hf_token)
+
+    # Create repository if it doesn't exist
+    try:
+        create_repo(
+            repo_id=repo_name,
+            token=hf_token,
+            private=private,
+            repo_type=repo_type,
+            exist_ok=True,
+        )
+        log.info(f"Repository created/verified: {repo_name}")
+    except Exception as e:
+        log.error(f"Failed to create repository: {e}")
+        raise
+
+    # Upload each JSONL file
+    for jsonl_file in jsonl_files:
+        path_in_repo = jsonl_file.name
+        log.info(f"Uploading {jsonl_file.name} to {path_in_repo}")
+
+        try:
+            api.upload_file(
+                repo_id=repo_name,
+                path_or_fileobj=str(jsonl_file),
+                path_in_repo=path_in_repo,
+                repo_type=repo_type,
+                commit_message=commit_message or f"Upload {jsonl_file.name}",
+            )
+            log.info(f"Successfully uploaded {jsonl_file.name}")
+        except Exception as e:
+            log.error(f"Failed to upload {jsonl_file.name}: {e}")
+            raise
+
+    repo_url = f"https://huggingface.co/{repo_name}"
+    log.info(f"All files uploaded successfully!")
+    log.info(f"Repository URL: {repo_url}")
+
+    return repo_url
