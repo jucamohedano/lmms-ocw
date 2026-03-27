@@ -250,6 +250,17 @@ class Model(ABC):
 
         return self._model
 
+    def _get_prepared_model(self) -> torch.nn.Module:
+        """Return the module used for training/inference after ``accelerator.prepare``.
+
+        (e.g. FSDP-wrapped).
+
+        Prefer the stored ``_model`` (possibly wrapped) over :attr:`model`, which unwraps for
+        convenience. ``getattr`` fallback supports edge cases; normal :class:`Model` init always
+        sets ``_model``.
+        """
+        return getattr(self, "_model", self.model)
+
     @property
     def processor(self) -> Any:  # noqa: ANN401
         """Return the model processor."""

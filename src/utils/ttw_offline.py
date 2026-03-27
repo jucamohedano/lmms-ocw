@@ -135,7 +135,7 @@ def _run_offline_loop(args, task_manager, task_names, backend):
 def _make_hf_backend(args):
     """Initialise the HuggingFace model + CLIP and return a generate callable."""
     from src.models._api import get_model
-    from src.models._ttw_wrapper import TTW_AUXILIARY_PROMPTS
+    from src.models.ttw import TTW_AUXILIARY_PROMPTS
 
     log.info(f"Loading Base MLLM '{args.model}' (Args: {args.model_args})...")
     model_kwargs = utils.parse_string_args(args.model_args)
@@ -182,7 +182,7 @@ def _make_vllm_backend(args):
     from transformers import AutoProcessor, CLIPModel, CLIPProcessor
     from vllm import LLM, SamplingParams
 
-    from src.models._ttw_wrapper import TTW_AUXILIARY_PROMPTS
+    from src.models.ttw import TTW_AUXILIARY_PROMPTS
 
     model_kwargs = utils.parse_string_args(args.model_args)
     max_model_len = model_kwargs.get("ttw_vllm_max_model_len", 4096)

@@ -32,7 +32,7 @@ from src.models._phi3v import Phi3v
 from src.models._qwen2_vl import Qwen2VL
 from src.models._qwen2_vl_cluster import Qwen2VLCluster
 from src.models._rag_majority_voting import RAGMajorityVoting
-from src.models._ttw_wrapper import TTWModel
+from src.models.ttw import TTWModel
 
 __all__ = [
     "MODELS",

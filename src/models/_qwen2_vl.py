@@ -240,29 +240,16 @@ class Qwen2VL(Model):
     def _apply_lora_peft(self) -> None:
         """Attach LoRA adapters with PEFT (FSDP-compatible)."""
         try:
-            from peft import LoraConfig, TaskType, get_peft_model
+            from peft import LoraConfig, get_peft_model
         except ImportError as exc:
             raise ImportError(
                 "LoRA finetuning requested but PEFT is not installed. "
                 "Install with `pip install peft`."
             ) from exc
 
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            lora_dropout=0.05,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
-        )
+        from src.models.ttw._config import get_lora_config_dict
+
+        lora_config = LoraConfig(**get_lora_config_dict())
         if hasattr(self._model, "enable_input_require_grads"):
             self._model.enable_input_require_grads()
         self._model = get_peft_model(self._model, lora_config)
@@ -880,10 +867,6 @@ class Qwen2VL(Model):
         generation_output = self._generate_from_inputs(inputs, gen_kwargs, output_scores=True)
 
         return inputs, generation_output
-
-    def _get_prepared_model(self) -> torch.nn.Module:
-        """Return the prepared model wrapper, preserving FSDP when present."""
-        return getattr(self, "_model", self.model)
 
     def _generate_with_hf_generate(
         self, inputs: dict, gen_kwargs: dict, *, output_scores: bool
@@ -2348,7 +2331,7 @@ def qwen2_vl_mmrait(**model_kwargs) -> Model:
     return model
 
 
-from src.models._ttw_wrapper import TTWModel  # noqa: E402, I001
+from src.models.ttw import TTWModel  # noqa: E402, I001
 
 
 @register_model("qwen2-vl-2b-ttw")
