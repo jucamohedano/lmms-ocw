@@ -227,6 +227,11 @@ def _run_single_evaluation(args: argparse.Namespace) -> tuple[dict, dict] | tupl
 
         return generate_offline_captions(args, task_manager, task_names)
 
+    if getattr(args, "ttw_grpo_generate", False):
+        from src.utils.ttw_offline import generate_grpo_dataset
+
+        return generate_grpo_dataset(args, task_manager, task_names)
+
     results = simple_evaluate(
         model_name=args.model,
         model_args=args.model_args,
@@ -638,10 +643,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether you will process you dataset with audio, image.",
     )
-    parser.add_argument(
+    ttw_group = parser.add_mutually_exclusive_group()
+    ttw_group.add_argument(
         "--ttw_offline_generate",
         action="store_true",
         help="If set, skips evaluation and generates TTW caption datasets offline.",
+    )
+    ttw_group.add_argument(
+        "--ttw_grpo_generate",
+        action="store_true",
+        help="If set, generates verl-compatible GRPO parquet datasets (no model inference).",
     )
     parser.add_argument(
         "--ttw_use_vllm",
