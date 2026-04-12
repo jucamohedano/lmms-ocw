@@ -10,12 +10,17 @@ Supports two independent output paths:
       - vLLM (``--ttw_use_vllm``): uses vLLM's optimised inference engine
 
 **Path 2 — verl GRPO**
-    Generates verl-compatible parquet datasets for GRPO training.
+    Generates verl-compatible parquet datasets for GRPO training (reward v2:
+    structured ``<HasProperty>`` / ``<HasA>`` / ``<AtLocation>`` tags between
+    ``</redacted_thinking>`` and ``<answer>``; see ``docs/reward_design_v2.md``).
     No model inference at dataset-prep time — verl's own vLLM handles rollouts
-    during training. Images are stored in a top-level ``images`` column using
-    HuggingFace datasets' ``Image`` feature so verl can load them natively via
-    ``data.image_key=images`` in the launch script.
+    during training. Per-label ConceptNet metadata is *not* embedded in parquet;
+    the verl reward loads JSON from ``verl/.../reward_score/metadata/``.
+    Images use a top-level ``images`` column (``data.image_key=images``).
     Entry point: ``generate_grpo_dataset``
+
+    Path 1 (CLIP JSONL warmup) is unchanged and still uses free-form caption
+    prompts from ``TTW_AUXILIARY_PROMPTS`` — independent of this GRPO schema.
 
 Both paths share task-loading helpers but are otherwise independent.
 """
@@ -33,21 +38,31 @@ from src import utils
 log = utils.get_logger(__name__, rank_zero_only=True)
 
 # ---------------------------------------------------------------------------
-# GRPO prompt constants
+# GRPO prompt constants (reward v2 — matches docs/reward_design_v2.md)
 # ---------------------------------------------------------------------------
 
-_GRPO_SYSTEM_PROMPT = (
-    "You are an image classifier. Carefully examine the image and identify "
-    "what it shows.\n"
-    "First reason briefly inside <think> </think> tags, then output exactly "
-    "ONE class label inside <answer> </answer> tags.\n"
-    "Example: <think>This looks like a spotted dog breed.</think>"
-    "<answer>dalmatian</answer>"
-)
+_GRPO_SYSTEM_PROMPT = """You are an expert visual classifier. For each image,
+reason about what you see, list visible attributes, and produce a single label.
 
-_GRPO_USER_PROMPT = (
-    "What category does this image belong to? " "Follow the required output format exactly."
-)
+Use this exact format:
+
+<thinking>your reasoning about the image</thinking>
+<HasProperty>visible properties, comma-separated</HasProperty>
+<HasA>visible parts, comma-separated</HasA>
+<AtLocation>visible setting or context</AtLocation>
+<answer>a single label, or 'none' to abstain</answer>
+
+Guidelines:
+- Keep each tag block to at most 5 short, comma-separated entries.
+- Use lowercase common terms (e.g. "striped", "tail", "jungle").
+- The <answer> must be a single label. Be as specific as you are confident
+  in — a correct general label (e.g. "dog") is better than a confident
+  guess at a specific one (e.g. "yorkshire terrier" when you cannot tell
+  the breed).
+- If the image is genuinely unrecognisable or you have no basis for any
+  label, answer "none". Abstaining honestly is better than guessing."""
+
+_GRPO_USER_PROMPT = "Classify the main object in this image."
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +413,9 @@ def generate_offline_captions(args, task_manager, task_names):
 def _build_grpo_parquet(task_obj, docs, split_name, task_name, limit):
     """Build a GRPO parquet dataset from a list of documents.
 
+    Schema matches verl expectations (``data_source`` keys reward metadata JSON
+    by task name). Prompts follow reward v2 (attribute tags + graded answer).
+
     Args:
         task_obj: The task object.
         docs: The list of documents.
@@ -469,7 +487,9 @@ def generate_grpo_dataset(args, task_manager, task_names):
 
     No model inference is performed. Images and ground-truth labels are read
     directly from the lm-eval task objects and written to parquet files that
-    verl can load with ``data.image_key=images``.
+    verl can load with ``data.image_key=images``. Install ConceptNet-derived
+    metadata as ``<verl>/utils/reward_score/metadata/<task_name>.json`` for the
+    graded reward (see ``docs/reward_design_v2.md``).
 
     Output layout::
 
