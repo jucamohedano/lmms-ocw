@@ -487,9 +487,10 @@ def generate_grpo_dataset(args, task_manager, task_names):
 
     No model inference is performed. Images and ground-truth labels are read
     directly from the lm-eval task objects and written to parquet files that
-    verl can load with ``data.image_key=images``. Install ConceptNet-derived
-    metadata as ``<verl>/utils/reward_score/metadata/<task_name>.json`` for the
-    graded reward (see ``docs/reward_design_v2.md``).
+    verl can load with ``data.image_key=images``.     Install ConceptNet-derived metadata for the graded reward (see
+    ``docs/reward_design_v2.md``). Either run with ``--conceptnet_assertions_gz``
+    to emit JSON next to the parquet run (under ``--grpo_reward_metadata_dir``),
+    or build metadata separately via ``python -m src.utils.grpo_conceptnet_metadata``.
 
     Output layout::
 
@@ -566,6 +567,52 @@ def generate_grpo_dataset(args, task_manager, task_names):
         log.info(f"Finished task: {task_name}")
 
     log.info("GRPO dataset generation complete.")
+
+    cn_gz = getattr(args, "conceptnet_assertions_gz", None)
+    if cn_gz:
+        from src.utils.grpo_conceptnet_metadata import (
+            build_metadata_for_grpo_tasks,
+            cache_suffix_for_skips,
+            parse_skip_attributes,
+        )
+
+        gz_path = Path(cn_gz)
+        if not gz_path.is_file():
+            raise FileNotFoundError(f"ConceptNet assertions not found: {gz_path}")
+
+        skip_list = getattr(args, "skip_attributes", None) or []
+        try:
+            reward_skip, _ = parse_skip_attributes(skip_list)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+        cache_pkl = getattr(args, "conceptnet_cache_pkl", None)
+        if not cache_pkl:
+            suffix = cache_suffix_for_skips(reward_skip)
+            cache_pkl = str(Path(args.output_path) / f".conceptnet_en_filtered{suffix}.pkl")
+
+        meta_dir = getattr(args, "grpo_reward_metadata_dir", None)
+        if not meta_dir:
+            meta_dir = str(Path(args.output_path) / "reward_metadata")
+
+        rebuild = getattr(args, "conceptnet_rebuild_cache", False)
+        log.info("=" * 60)
+        log.info("GRPO reward metadata (ConceptNet) -> %s", meta_dir)
+        log.info("=" * 60)
+        build_metadata_for_grpo_tasks(
+            task_manager=task_manager,
+            task_names=task_names,
+            conceptnet_gz=gz_path,
+            cache_pkl=Path(cache_pkl),
+            metadata_out_dir=Path(meta_dir),
+            rebuild_cache=rebuild,
+            skip_attributes=skip_list,
+        )
+        log.info(
+            "Copy or symlink `%s/*.json` to verl's "
+            "`verl/utils/reward_score/metadata/` for training, or set metadata path accordingly.",
+            meta_dir,
+        )
 
     if getattr(args, "ttw_upload_to_hf", False):
         hf_token = args.hf_token or os.environ.get("HF_TOKEN")
