@@ -10,12 +10,11 @@ Supports two independent output paths:
       - vLLM (``--ttw_use_vllm``): uses vLLM's optimised inference engine
 
 **Path 2 — verl GRPO**
-    Generates verl-compatible parquet datasets for GRPO training (reward v2:
-    structured ``<HasProperty>`` / ``<HasA>`` / ``<AtLocation>`` tags between
-    ``</redacted_thinking>`` and ``<answer>``; see ``docs/reward_design_v2.md``).
+    Generates verl-compatible parquet datasets for GRPO training (reward v3:
+    nested ``<HasProperty>`` / ``<HasA>`` / ``<AtLocation>`` tags inside a
+    ``<think>...</think>`` scratchpad; see ``docs/reward_design_v3.md``).
     No model inference at dataset-prep time — verl's own vLLM handles rollouts
-    during training. Per-label ConceptNet metadata is *not* embedded in parquet;
-    the verl reward loads JSON from ``verl/.../reward_score/metadata/``.
+    during training. No external metadata is required by the reward.
     Images use a top-level ``images`` column (``data.image_key=images``).
     Entry point: ``generate_grpo_dataset``
 
@@ -38,29 +37,31 @@ from src import utils
 log = utils.get_logger(__name__, rank_zero_only=True)
 
 # ---------------------------------------------------------------------------
-# GRPO prompt constants (reward v2 — matches docs/reward_design_v2.md)
+# GRPO prompt constants (reward v3 — matches docs/reward_design_v3.md)
 # ---------------------------------------------------------------------------
 
-_GRPO_SYSTEM_PROMPT = """You are an expert visual classifier. For each image,
-reason about what you see, list visible attributes, and produce a single label.
+_GRPO_SYSTEM_PROMPT = """You are an expert visual reasoner. For every image,
+first think through what you see inside <think>...</think>, using three sub-tags:
+<HasProperty> for visible properties, <HasA> for visible parts, and
+<AtLocation> for visible setting or context.
 
-Use this exact format:
+Use this exact structure:
 
-<thinking>your reasoning about the image</thinking>
-<HasProperty>visible properties, comma-separated</HasProperty>
-<HasA>visible parts, comma-separated</HasA>
-<AtLocation>visible setting or context</AtLocation>
-<answer>a single label, or 'none' to abstain</answer>
+<think>
+<HasProperty>2-5 short, comma-separated visible properties</HasProperty>
+<HasA>2-5 short, comma-separated visible parts</HasA>
+<AtLocation>2-5 short, comma-separated visible settings or places</AtLocation>
+Reason on the attributes extracted to answer the user's question after thinking.
+
+</think>
+answer the user's question directly
 
 Guidelines:
-- Keep each tag block to at most 5 short, comma-separated entries.
 - Use lowercase common terms (e.g. "striped", "tail", "jungle").
-- The <answer> must be a single label. Be as specific as you are confident
-  in — a correct general label (e.g. "dog") is better than a confident
-  guess at a specific one (e.g. "yorkshire terrier" when you cannot tell
-  the breed).
-- If the image is genuinely unrecognisable or you have no basis for any
-  label, answer "none". Abstaining honestly is better than guessing."""
+- Keep each entry short and concrete.
+- After </think>, answer the user's question directly.
+- If they ask you to classify, emit a single label only.
+- If they ask you to describe or explain, emit a natural-language answer."""
 
 _GRPO_USER_PROMPT = "Classify the main object in this image."
 
@@ -413,8 +414,8 @@ def generate_offline_captions(args, task_manager, task_names):
 def _build_grpo_parquet(task_obj, docs, split_name, task_name, limit):
     """Build a GRPO parquet dataset from a list of documents.
 
-    Schema matches verl expectations (``data_source`` keys reward metadata JSON
-    by task name). Prompts follow reward v2 (attribute tags + graded answer).
+    Schema matches verl expectations. Prompts follow reward v3: a nested
+    think-block scratchpad plus free-form post-think answer text.
 
     Args:
         task_obj: The task object.
@@ -487,10 +488,8 @@ def generate_grpo_dataset(args, task_manager, task_names):
 
     No model inference is performed. Images and ground-truth labels are read
     directly from the lm-eval task objects and written to parquet files that
-    verl can load with ``data.image_key=images``.     Install ConceptNet-derived metadata for the graded reward (see
-    ``docs/reward_design_v2.md``). Either run with ``--conceptnet_assertions_gz``
-    to emit JSON next to the parquet run (under ``--grpo_reward_metadata_dir``),
-    or build metadata separately via ``python -m src.utils.grpo_conceptnet_metadata``.
+    verl can load with ``data.image_key=images``. Reward v3 uses only the
+    sample ground-truth label, so no external metadata build step is required.
 
     Output layout::
 
@@ -567,52 +566,6 @@ def generate_grpo_dataset(args, task_manager, task_names):
         log.info(f"Finished task: {task_name}")
 
     log.info("GRPO dataset generation complete.")
-
-    cn_gz = getattr(args, "conceptnet_assertions_gz", None)
-    if cn_gz:
-        from src.utils.grpo_conceptnet_metadata import (
-            build_metadata_for_grpo_tasks,
-            cache_suffix_for_skips,
-            parse_skip_attributes,
-        )
-
-        gz_path = Path(cn_gz)
-        if not gz_path.is_file():
-            raise FileNotFoundError(f"ConceptNet assertions not found: {gz_path}")
-
-        skip_list = getattr(args, "skip_attributes", None) or []
-        try:
-            reward_skip, _ = parse_skip_attributes(skip_list)
-        except ValueError as exc:
-            raise ValueError(str(exc)) from exc
-
-        cache_pkl = getattr(args, "conceptnet_cache_pkl", None)
-        if not cache_pkl:
-            suffix = cache_suffix_for_skips(reward_skip)
-            cache_pkl = str(Path(args.output_path) / f".conceptnet_en_filtered{suffix}.pkl")
-
-        meta_dir = getattr(args, "grpo_reward_metadata_dir", None)
-        if not meta_dir:
-            meta_dir = str(Path(args.output_path) / "reward_metadata")
-
-        rebuild = getattr(args, "conceptnet_rebuild_cache", False)
-        log.info("=" * 60)
-        log.info("GRPO reward metadata (ConceptNet) -> %s", meta_dir)
-        log.info("=" * 60)
-        build_metadata_for_grpo_tasks(
-            task_manager=task_manager,
-            task_names=task_names,
-            conceptnet_gz=gz_path,
-            cache_pkl=Path(cache_pkl),
-            metadata_out_dir=Path(meta_dir),
-            rebuild_cache=rebuild,
-            skip_attributes=skip_list,
-        )
-        log.info(
-            "Copy or symlink `%s/*.json` to verl's "
-            "`verl/utils/reward_score/metadata/` for training, or set metadata path accordingly.",
-            meta_dir,
-        )
 
     if getattr(args, "ttw_upload_to_hf", False):
         hf_token = args.hf_token or os.environ.get("HF_TOKEN")

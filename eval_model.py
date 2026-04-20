@@ -689,53 +689,6 @@ if __name__ == "__main__":
         default=None,
         help="Limit offline captions. Separate from --limit for standard eval.",
     )
-    parser.add_argument(
-        "--conceptnet_assertions_gz",
-        type=str,
-        default=None,
-        help=(
-            "Path to conceptnet-assertions-5.7.0.csv.gz. When set together with "
-            "--ttw_grpo_generate, builds reward JSON files under --grpo_reward_metadata_dir."
-        ),
-    )
-    parser.add_argument(
-        "--conceptnet_cache_pkl",
-        type=str,
-        default=None,
-        help=(
-            "Pickle cache for filtered English ConceptNet edges. "
-            "Default: <output_path>/.conceptnet_en_filtered.pkl, or "
-            ".conceptnet_en_filtered.skip_<rels>.pkl when using --skip-att "
-            "(must match skips or reload with --conceptnet_rebuild_cache)."
-        ),
-    )
-    parser.add_argument(
-        "--conceptnet_rebuild_cache",
-        action="store_true",
-        help="Rebuild ConceptNet pickle cache from the gzipped assertions file.",
-    )
-    parser.add_argument(
-        "--grpo_reward_metadata_dir",
-        type=str,
-        default=None,
-        help=(
-            "Where to write <task_name>.json for the verl classification reward. "
-            "Default: <output_path>/reward_metadata"
-        ),
-    )
-    parser.add_argument(
-        "--skip-att",
-        dest="skip_attributes",
-        action="append",
-        default=None,
-        metavar="REL",
-        help=(
-            "Repeatable (with --conceptnet_assertions_gz). Skip this attribute in "
-            "reward metadata and omit its ConceptNet edges when building the cache: "
-            "HasProperty, HasA, or AtLocation. Example: --skip-att AtLocation. "
-            "Default ConceptNet pickle name gains a .skip_* suffix."
-        ),
-    )
     args = parser.parse_args()
 
     main(args)

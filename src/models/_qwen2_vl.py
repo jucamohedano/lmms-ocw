@@ -2337,7 +2337,7 @@ from src.models.ttw import TTWModel  # noqa: E402, I001
 @register_model("qwen2-vl-2b-ttw")
 def qwen2_vl_2b_ttw(**model_kwargs) -> Model:
     """Load Qwen2VL-2B with Test-Time Warmup."""
-    model_name_or_path = "Qwen/Qwen2-VL-2B-Instruct"
+    model_name_or_path = model_kwargs.pop("model_name_or_path", "Qwen/Qwen2-VL-2B-Instruct")
     offline_caption_dir = model_kwargs.pop("offline_caption_dir", None)
     ttw_lr = model_kwargs.pop("ttw_lr", 1e-6)
     ttw_epochs = model_kwargs.pop("ttw_epochs", 2)
@@ -2381,7 +2381,7 @@ def qwen2_vl_2b_ttw(**model_kwargs) -> Model:
 @register_model("qwen2-vl-7b-ttw")
 def qwen2_vl_7b_ttw(**model_kwargs) -> Model:
     """Load Qwen2VL-7B with Test-Time Warmup."""
-    model_name_or_path = "Qwen/Qwen2-VL-7B-Instruct"
+    model_name_or_path = model_kwargs.pop("model_name_or_path", "Qwen/Qwen2-VL-7B-Instruct")
     offline_caption_dir = model_kwargs.pop("offline_caption_dir", None)
     ttw_lr = model_kwargs.pop("ttw_lr", 1e-6)
     ttw_epochs = model_kwargs.pop("ttw_epochs", 2)
