@@ -14,7 +14,7 @@ from accelerate import DistributedType
 from PIL import Image
 from qwen_vl_utils import process_vision_info
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
+from transformers import AutoProcessor, AutoTokenizer
 from transformers.generation import (
     LogitsProcessorList,
     TemperatureLogitsWarper,
@@ -27,6 +27,7 @@ from src.data.tasks import TaskInstance, TaskSingleOutput
 from src.data.tasks._manager import ConfigurableTask
 from src.models._api import register_model
 from src.models._base import Model
+from src.models._qwen_vl_version import get_qwen_vl_model_class, is_qwen2_5_vl_checkpoint
 from src.retrieval import Retriever
 
 __all__ = ["Qwen2VL"]
@@ -189,17 +190,8 @@ class Qwen2VL(Model):
         if self._quantization_config is not None:
             model_kwargs["quantization_config"] = self._quantization_config
 
-        PretrainedModel = Qwen2VLForConditionalGeneration
-        if "Qwen2.5" in self._model_name_or_path:
-            try:
-                from transformers import Qwen2_5_VLForConditionalGeneration
-            except ImportError as e:
-                raise ValueError(
-                    "Failed to import Qwen2_5_VLForConditionalGeneration."
-                    " Please upgrade transformers to a later version."
-                ) from e
-
-            PretrainedModel = Qwen2_5_VLForConditionalGeneration
+        is_qwen2_5_vl = is_qwen2_5_vl_checkpoint(self._model_name_or_path)
+        PretrainedModel = get_qwen_vl_model_class(self._model_name_or_path)
 
         self._model = PretrainedModel.from_pretrained(self._model_name_or_path, **model_kwargs)
         if self._compile:
@@ -209,7 +201,7 @@ class Qwen2VL(Model):
         )
         self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
 
-        if "Qwen2.5" in self._model_name_or_path:
+        if is_qwen2_5_vl:
             self._processor.tokenizer.padding_side = "left"
             self._tokenizer.padding_side = "left"
 
@@ -1170,14 +1162,15 @@ class Qwen2VL(Model):
             answers = self._decode(inputs, generation_output)
 
             for ans_idx, answer in enumerate(answers):
+                if "</think>" in answer:
+                    answer = answer.split("</think>")[-1]
+
                 if "Answer:" in answer:
-                    answers[ans_idx] = (
-                        answer.split("Answer:")[-1]
-                        .replace("[", "")
-                        .replace("]", "")
-                        .replace('"', "")
-                        .strip()
-                    )
+                    answer = answer.split("Answer:")[-1]
+
+                answers[ans_idx] = (
+                    answer.replace("[", "").replace("]", "").replace('"', "").strip()
+                )
 
             gen_metrics = self._loglikelihood(inputs, generation_output)
 
@@ -2266,12 +2259,16 @@ class Qwen2VL(Model):
         """
         msg = [
             {
+                "role": "system",
+                "content": [{"type": "text", "text": utils._GRPO_SYSTEM_PROMPT}],
+            },
+            {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": image},
                     {"type": "text", "text": prompt},
                 ],
-            }
+            },
         ]
         if caption is not None:
             msg.append(
@@ -2382,6 +2379,51 @@ def qwen2_vl_2b_ttw(**model_kwargs) -> Model:
 def qwen2_vl_7b_ttw(**model_kwargs) -> Model:
     """Load Qwen2VL-7B with Test-Time Warmup."""
     model_name_or_path = model_kwargs.pop("model_name_or_path", "Qwen/Qwen2-VL-7B-Instruct")
+    offline_caption_dir = model_kwargs.pop("offline_caption_dir", None)
+    ttw_lr = model_kwargs.pop("ttw_lr", 1e-6)
+    ttw_epochs = model_kwargs.pop("ttw_epochs", 2)
+    ttw_batch_size = model_kwargs.pop("ttw_batch_size", 5)
+    ttw_num_candidates = model_kwargs.pop("ttw_num_candidates", 10)
+    ttw_caption_temperature = model_kwargs.pop("ttw_caption_temperature", 0.75)
+    ttw_max_new_tokens = model_kwargs.pop("ttw_max_new_tokens", 128)
+    clip_model_name = model_kwargs.pop("clip_model_name", None)
+    ttw_finetune_method = model_kwargs.pop("ttw_finetune_method", "full")
+    ttw_lora_backend = model_kwargs.pop("ttw_lora_backend", "peft")
+    ttw_svf_rank = model_kwargs.pop("ttw_svf_rank", -1)
+    ttw_compile = model_kwargs.pop("ttw_compile", False)
+    ttw_grad_accum = model_kwargs.pop("ttw_grad_accum", False)
+    ttw_concurrent_warmups = model_kwargs.pop("ttw_concurrent_warmups", 1)
+    base = Qwen2VL(
+        model_name_or_path,
+        compile=ttw_compile,
+        lora_backend=ttw_lora_backend,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+        **model_kwargs,
+    )
+    return TTWModel(
+        base,
+        ttw_lr=ttw_lr,
+        ttw_epochs=ttw_epochs,
+        ttw_batch_size=ttw_batch_size,
+        ttw_num_candidates=ttw_num_candidates,
+        ttw_caption_temperature=ttw_caption_temperature,
+        ttw_max_new_tokens=ttw_max_new_tokens,
+        clip_model_name=clip_model_name,
+        offline_caption_dir=offline_caption_dir,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+        ttw_grad_accum=ttw_grad_accum,
+        ttw_concurrent_warmups=ttw_concurrent_warmups,
+    )
+
+
+@register_model("qwen2.5-vl-7b-ttw")
+def qwen25_vl_7b_ttw(**model_kwargs) -> Model:
+    """Load Qwen2.5-VL-7B with Test-Time Warmup."""
+    model_name_or_path = model_kwargs.pop("model_name_or_path", "Qwen/Qwen2.5-VL-7B-Instruct")
     offline_caption_dir = model_kwargs.pop("offline_caption_dir", None)
     ttw_lr = model_kwargs.pop("ttw_lr", 1e-6)
     ttw_epochs = model_kwargs.pop("ttw_epochs", 2)

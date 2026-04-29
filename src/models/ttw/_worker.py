@@ -22,6 +22,7 @@ from torch.optim import AdamW
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
+from src.models._qwen_vl_version import get_qwen_vl_model_class
 from src.models.ttw._batch import build_training_batch, format_chat
 from src.models.ttw._liger import run_liger_training, try_create_liger_loss
 from src.utils import get_logger
@@ -161,9 +162,8 @@ def init_worker(
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             # Load base model
-            from transformers import Qwen2VLForConditionalGeneration
-
-            _worker_model = Qwen2VLForConditionalGeneration.from_pretrained(
+            PretrainedModel = get_qwen_vl_model_class(model_path)
+            _worker_model = PretrainedModel.from_pretrained(
                 model_path,
                 torch_dtype=dtype,
                 device_map={"": _worker_gpu_id},
