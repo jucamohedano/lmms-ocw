@@ -35,6 +35,7 @@ from src.utils._decorators import deprecated_positional, rank_zero_only
 from src.utils._engine_utils import run_task_tests
 from src.utils._logging_utils import get_logger
 from src.utils._models_utils import Collator
+from src.utils.ttw_offline import _GRPO_SYSTEM_PROMPT
 
 __all__ = [
     "Collator",
@@ -71,4 +72,5 @@ __all__ = [
     "sanitize_task_name",
     "save_to_cache",
     "default_vocabulary_transforms",
+    "_GRPO_SYSTEM_PROMPT",
 ]

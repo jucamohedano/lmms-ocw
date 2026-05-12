@@ -12,7 +12,7 @@ Supports two independent output paths:
 **Path 2 — verl GRPO**
     Generates verl-compatible parquet datasets for GRPO training (reward v3:
     nested ``<HasProperty>`` / ``<HasA>`` / ``<AtLocation>`` tags inside a
-    ``<think>...</think>`` scratchpad; see ``docs/reward_design_v3.md``).
+    ``<think>...</think>`` scratchpad; see ``docs/grpo/reward_design_v3.md``).
     No model inference at dataset-prep time — verl's own vLLM handles rollouts
     during training. No external metadata is required by the reward.
     Images use a top-level ``images`` column (``data.image_key=images``).
@@ -20,6 +20,8 @@ Supports two independent output paths:
 
     Path 1 (CLIP JSONL warmup) is unchanged and still uses free-form caption
     prompts from ``TTW_AUXILIARY_PROMPTS`` — independent of this GRPO schema.
+    Use ``--ttw_offline_vanilla_chat`` for a short default system message instead
+    of the GRPO scratchpad when generating those captions.
 
 Both paths share task-loading helpers but are otherwise independent.
 """
@@ -37,7 +39,7 @@ from src import utils
 log = utils.get_logger(__name__, rank_zero_only=True)
 
 # ---------------------------------------------------------------------------
-# GRPO prompt constants (reward v3 — matches docs/reward_design_v3.md)
+# GRPO prompt constants
 # ---------------------------------------------------------------------------
 
 _GRPO_SYSTEM_PROMPT = """You are an expert visual reasoner. For every image,
@@ -64,6 +66,9 @@ Guidelines:
 - If they ask you to describe or explain, emit a natural-language answer."""
 
 _GRPO_USER_PROMPT = "Classify the main object in this image."
+
+# Short instruct-system text for offline caption runs that should *not* use the GRPO scratchpad prompt.
+_TTW_VANILLA_SYSTEM_PROMPT = "You are a helpful assistant."
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +240,7 @@ def _make_hf_backend(args):
             temperature=args.ttw_offline_temperature,
             max_new_tokens=args.ttw_offline_max_new_tokens,
             batch_size=args.ttw_offline_batch_size,
+            vanilla_chat=getattr(args, "ttw_offline_vanilla_chat", False),
         )
 
         filtered = []
@@ -260,29 +266,41 @@ def _make_vllm_backend(args):
 
     import numpy as np
     from transformers import AutoProcessor, CLIPModel, CLIPProcessor
-    from vllm import LLM, SamplingParams
 
     from src.models.ttw import TTW_AUXILIARY_PROMPTS
 
     model_kwargs = utils.parse_string_args(args.model_args)
     max_model_len = model_kwargs.get("ttw_vllm_max_model_len", 4096)
     gpu_memory_utilization = model_kwargs.get("ttw_vllm_gpu_util", 0.85)
-    pretrained_path = model_kwargs.get("pretrained", args.model)
+    mm_encoder_attn_backend = model_kwargs.get("ttw_vllm_mm_encoder_attn_backend", "TORCH_SDPA")
+    pretrained_path = (
+        model_kwargs.get("pretrained") or model_kwargs.get("model_name_or_path") or args.model
+    )
+
+    # vLLM must see this before import/engine construction. ``spawn`` avoids
+    # CUDA re-init failures if another library has already touched torch.cuda.
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+    from vllm import LLM, SamplingParams
 
     # Set seeds
     seed = args.seed[0] if isinstance(args.seed, list) else args.seed
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
-    log.info("Loading vLLM engine...")
+    log.info(f"Loading vLLM engine from '{pretrained_path}'...")
+    log.info(
+        "vLLM config: VLLM_WORKER_MULTIPROC_METHOD=%s, mm_encoder_attn_backend=%s",
+        os.environ.get("VLLM_WORKER_MULTIPROC_METHOD"),
+        mm_encoder_attn_backend,
+    )
     llm = LLM(
         model=pretrained_path,
         max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization,
         trust_remote_code=True,
         enforce_eager=True,
+        mm_encoder_attn_backend=mm_encoder_attn_backend,
     )
     log.info("vLLM engine loaded.")
 
@@ -295,15 +313,22 @@ def _make_vllm_backend(args):
 
     processor = AutoProcessor.from_pretrained(pretrained_path, trust_remote_code=True)
 
+    use_vanilla = getattr(args, "ttw_offline_vanilla_chat", False)
+    system_text = _TTW_VANILLA_SYSTEM_PROMPT if use_vanilla else utils._GRPO_SYSTEM_PROMPT
+
     def _format_prompt(prompt: str) -> str:
         messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": system_text}],
+            },
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": "placeholder"},
                     {"type": "text", "text": prompt},
                 ],
-            }
+            },
         ]
         return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -376,6 +401,7 @@ def generate_offline_captions(args, task_manager, task_names):
     log.info(f"  Temperature:      {args.ttw_offline_temperature}")
     log.info(f"  Max new tokens:   {args.ttw_offline_max_new_tokens}")
     log.info(f"  Output path:      {args.output_path}")
+    log.info(f"  Vanilla chat:    {getattr(args, 'ttw_offline_vanilla_chat', False)}")
     log.info("=" * 60)
 
     if use_vllm:

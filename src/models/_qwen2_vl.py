@@ -2164,6 +2164,8 @@ class Qwen2VL(Model):
         temperature: float,
         max_new_tokens: int,
         batch_size: int = 1,
+        *,
+        vanilla_chat: bool = False,
     ) -> list[tuple[str, list[str]]]:
         """Generate caption candidates for each prompt using this model's chat format.
 
@@ -2175,6 +2177,8 @@ class Qwen2VL(Model):
             temperature: Sampling temperature for generation.
             max_new_tokens: Maximum new tokens to generate.
             batch_size: Used for batching during internal token generation.
+            vanilla_chat: If True, use a short default system message instead
+            of the GRPO scratchpad prompt.
 
         Returns:
         -------
@@ -2187,7 +2191,7 @@ class Qwen2VL(Model):
         # ttw_format_chat + apply_chat_template calls across candidates)
         formatted_texts = {}
         for prompt in prompts:
-            msg = self.ttw_format_chat(image, prompt)
+            msg = self.ttw_format_chat(image, prompt, vanilla_chat=vanilla_chat)
             formatted_texts[prompt] = self.processor.apply_chat_template(
                 msg, tokenize=False, add_generation_prompt=True
             )
@@ -2243,6 +2247,8 @@ class Qwen2VL(Model):
         image: Image.Image,
         prompt: str,
         caption: str | None = None,
+        *,
+        vanilla_chat: bool = False,
     ) -> list[dict]:
         """Format a TTW chat message for this model's chat template.
 
@@ -2251,16 +2257,19 @@ class Qwen2VL(Model):
             image: The input image.
             prompt: The user prompt.
             caption: Optional assistant caption. If provided, appends an assistant turn.
+            vanilla_chat: If True, use ``You are a helpful assistant.``
+            instead of the GRPO scratchpad system prompt.
 
         Returns:
         -------
             List of message dicts ready for `apply_chat_template`.
 
         """
+        system_text = "You are a helpful assistant." if vanilla_chat else utils._GRPO_SYSTEM_PROMPT
         msg = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": utils._GRPO_SYSTEM_PROMPT}],
+                "content": [{"type": "text", "text": system_text}],
             },
             {
                 "role": "user",
@@ -2307,7 +2316,7 @@ def qwen2_vl_2b(**model_kwargs) -> Model:
 @register_model("qwen2.5-vl-7b")
 def qwen25_vl_7b(**model_kwargs) -> Model:
     """Load the Qwen2.5VL model with 7B params."""
-    model_name_or_path = "Qwen/Qwen2.5-VL-7B-Instruct"
+    model_name_or_path = model_kwargs.pop("model_name_or_path", "Qwen/Qwen2.5-VL-7B-Instruct")
     model = Qwen2VL(model_name_or_path, **model_kwargs)
     return model
 
