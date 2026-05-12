@@ -346,18 +346,26 @@ def main(args: argparse.Namespace) -> None:
         wandb_kwargs["config"] = wandb_config
 
         if is_ttw_run:
-            import wandb
-
             wandb_kwargs["mode"] = os.environ.get(
                 "WANDB_MODE", wandb_kwargs.get("mode", "offline")
             )
-            wandb_run = wandb.init(**wandb_kwargs)
-        else:
-            wandb_logger = WandbLogger(**wandb_kwargs)
+
+        wandb_logger = WandbLogger(**wandb_kwargs)
+        #     import wandb
+
+        #     wandb_kwargs["mode"] = os.environ.get(
+        #         "WANDB_MODE", wandb_kwargs.get("mode", "offline")
+        #     )
+        #     wandb_run = wandb.init(**wandb_kwargs)
+        # else:
+        #     wandb_logger = WandbLogger(**wandb_kwargs)
 
     # Set logging level from CLI argument
     eval_logger_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(level=eval_logger_level)
+    # Silence noisy third-party loggers even when our code runs at DEBUG.
+    for noisy in ("PIL", "fsspec", "urllib3", "matplotlib", "filelock"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     log.setLevel(eval_logger_level)
     log.info("Log level set to %s", args.log_level)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -688,6 +696,14 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Limit offline captions. Separate from --limit for standard eval.",
+    )
+    parser.add_argument(
+        "--ttw_offline_vanilla_chat",
+        action="store_true",
+        help=(
+            "With --ttw_offline_generate: use a short default system prompt "
+            '("You are a helpful assistant.") instead of the GRPO scratchpad system prompt.'
+        ),
     )
     args = parser.parse_args()
 

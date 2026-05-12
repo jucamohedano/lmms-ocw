@@ -213,8 +213,8 @@ def run_warmup(
     lr: float,
     batch_size: int,
     grad_accum: bool = True,
-) -> dict[str, torch.Tensor]:
-    """Train adaptation parameters on one image and return state dict on CPU.
+) -> tuple[dict[str, torch.Tensor], list[float]]:
+    """Train adaptation parameters on one image and return state dict + losses.
 
     Called per image from the main process via ``pool.submit``.
 
@@ -230,7 +230,7 @@ def run_warmup(
 
     Returns:
     -------
-        Dict of adapted state tensors (filtered by method) on CPU.
+        Tuple of (filtered state dict on CPU, per-step loss values).
 
     """
     global _worker_model, _worker_processor, _worker_initial_state
@@ -249,7 +249,7 @@ def run_warmup(
 
     if _worker_liger_loss_fn is not None:
         # Liger path (works for both LoRA and SVF)
-        run_liger_training(
+        losses = run_liger_training(
             model,
             processor,
             image,
@@ -263,7 +263,7 @@ def run_warmup(
         )
     else:
         # Unified HF fallback path (works for both LoRA and SVF)
-        _run_hf_fallback_training(
+        losses = _run_hf_fallback_training(
             model,
             processor,
             image,
@@ -278,8 +278,9 @@ def run_warmup(
 
     torch.cuda.empty_cache()
 
-    # Return filtered state dict on CPU
-    return {k: v.cpu() for k, v in model.state_dict().items() if _worker_filter_fn(k)}
+    # Return filtered state dict on CPU + per-step losses
+    state_dict = {k: v.cpu() for k, v in model.state_dict().items() if _worker_filter_fn(k)}
+    return state_dict, losses
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -307,10 +308,11 @@ def _run_hf_fallback_training(
     grad_accum: bool,
     device: torch.device,
     model_dtype: torch.dtype,
-) -> None:
+) -> list[float]:
     """Unified HF fallback training loop (when Liger unavailable)."""
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=lr, foreach=False)
+    losses: list[float] = []
 
     model.train()
     with torch.enable_grad(), torch.autocast("cuda", dtype=model_dtype):
@@ -326,6 +328,7 @@ def _run_hf_fallback_training(
                 if total_tokens == 0:
                     continue
 
+                step_loss = 0.0
                 if grad_accum:
                     for caption_pair in batch_captions:
                         micro_batch = build_training_batch(
@@ -333,14 +336,18 @@ def _run_hf_fallback_training(
                         )
                         out = model(**micro_batch)
                         loss = out.loss / total_tokens  # Normalize by TOTAL tokens
+                        step_loss += loss.detach().item()
                         loss.backward()
                 else:
                     out = model(**batch_full)
                     loss = out.loss  # Already batch-averaged by HF
+                    step_loss = loss.detach().item()
                     loss.backward()
 
+                losses.append(step_loss)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
     model.eval()
     del optimizer, trainable_params
+    return losses

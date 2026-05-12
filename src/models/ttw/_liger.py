@@ -48,7 +48,7 @@ def liger_forward_backward(
     batch: dict[str, torch.Tensor],
     total_tokens: int,
     liger_loss_fn: torch.nn.Module,
-) -> None:
+) -> float:
     """Perform one forward + backward pass using Liger fused CE.
 
     This avoids computing full vocab logits by using Liger's fused implementation.
@@ -62,7 +62,7 @@ def liger_forward_backward(
 
     Returns:
     -------
-        None
+        float: The loss value for this step.
 
     """
     lm_head = model.get_output_embeddings()
@@ -76,8 +76,10 @@ def liger_forward_backward(
     shift_hidden = hidden[..., :-1, :].contiguous().view(-1, hidden.shape[-1])
     shift_labels = batch["labels"][..., 1:].contiguous().view(-1)
     loss = liger_loss_fn(lm_head.weight, shift_hidden, shift_labels)
-    loss = loss / total_tokens
-    loss.backward()
+    loss_normalized = loss / total_tokens
+    loss_val = loss_normalized.item()
+    loss_normalized.backward()
+    return loss_val
 
 
 def run_liger_training(
@@ -92,7 +94,7 @@ def run_liger_training(
     liger_loss_fn: torch.nn.Module,
     format_chat_fn: Callable | None = None,
     device: str | torch.device = "cuda",
-) -> None:
+) -> list[float]:
     """Run the training loop using Liger fused CE loss.
 
     Args:
@@ -111,7 +113,7 @@ def run_liger_training(
 
     Returns:
     -------
-        None
+        list[float]: Per-step loss values.
 
     """
     if format_chat_fn is None:
@@ -120,6 +122,7 @@ def run_liger_training(
     model_dtype = next(model.parameters()).dtype
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=lr, foreach=False)
+    losses: list[float] = []
 
     model.train()
     with torch.enable_grad(), torch.autocast("cuda", dtype=model_dtype):
@@ -139,19 +142,26 @@ def run_liger_training(
                         "Check that labels contain valid tokens (not all -100)."
                     )
 
+                step_loss = 0.0
                 if grad_accum:
                     # Gradient accumulation: process each caption separately
                     for caption_pair in batch_captions:
                         micro_batch = build_training_batch(
                             processor, image, [caption_pair], device, format_chat_fn
                         )
-                        liger_forward_backward(model, micro_batch, total_tokens, liger_loss_fn)
+                        step_loss += liger_forward_backward(
+                            model, micro_batch, total_tokens, liger_loss_fn
+                        )
                 else:
                     # Full batch forward
-                    liger_forward_backward(model, batch_full, total_tokens, liger_loss_fn)
+                    step_loss = liger_forward_backward(
+                        model, batch_full, total_tokens, liger_loss_fn
+                    )
 
+                losses.append(step_loss)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
     model.eval()
     del optimizer, trainable_params
+    return losses

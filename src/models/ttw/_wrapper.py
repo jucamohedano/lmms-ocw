@@ -223,26 +223,28 @@ def _log_gpu_memory(
         log.info(msg, *args)
 
 
-def _ttw_log_loss_to_wandb(
-    loss: float,
-    rank: int,
-    world_size: int,
-    global_step: int,
-    device: torch.device | None = None,
+def _log_ttw_warmup_losses(
+    losses: list[float],
+    *,
+    image_idx: int,
+    wandb_step_ref: list[int],
 ) -> None:
-    """Log TTW warmup loss (averaged across ranks) to WandB when enabled (--wandb_args).
+    """Log the losses to wandb."""
+    if not losses:
+        return
 
-    Only rank 0 logs. In distributed mode, loss is all-reduced and averaged first.
-    All ranks must participate in all_reduce (collective) to avoid deadlock.
-    """
-    dev = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-
-    if dist.is_initialized() and world_size > 1:
-        loss_tensor = torch.tensor([loss], dtype=torch.float32, device=dev)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        loss_to_log = loss_tensor.item() / world_size
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
     else:
-        loss_to_log = loss
+        world_size = 1
+        rank = 0
+
+    if world_size > 1:
+        gathered = [None] * world_size if rank == 0 else None
+        dist.gather_object(losses, gathered, dst=0)
+    else:
+        gathered = [losses]
 
     if rank != 0:
         return
@@ -250,10 +252,23 @@ def _ttw_log_loss_to_wandb(
     try:
         import wandb
 
-        if wandb.run is not None:
-            wandb.log({"ttw_warmup/loss": loss_to_log}, step=global_step)
+        if wandb.run is None:
+            return
     except ImportError:
-        log.warning("WandB not found, skipping loss logging.")
+        return
+
+    base_step = wandb_step_ref[0]
+    n_steps = len(losses)
+    for within_step in range(n_steps):
+        payload = {
+            "ttw_warmup/image_idx": image_idx,
+            "ttw_warmup/within_image_step": within_step,
+        }
+        for r, rank_losses in enumerate(gathered):
+            if rank_losses is not None and within_step < len(rank_losses):
+                payload[f"ttw_warmup/loss_rank{r}"] = rank_losses[within_step]
+        wandb.log(payload, step=base_step + within_step)
+    wandb_step_ref[0] = base_step + n_steps
 
 
 def _execute_concurrent_ttw_batches(
@@ -325,12 +340,41 @@ def _execute_concurrent_ttw_batches(
                     rank=rank,
                     level=logging.DEBUG,
                 )
+        worker_results = [f.result() if f is not None else None for f in futures]
 
-        worker_states = [f.result() if f is not None else None for f in futures]
+        # wandb_step_ref persists across batches via a mutable attribute on the model
+        if not hasattr(prepared_model, "_ttw_wandb_step_ref"):
+            prepared_model._ttw_wandb_step_ref = [0]
 
-        for req, wstate, (_, _, doc_id) in zip(batch, worker_states, items, strict=True):
-            if wstate is not None:
-                merge_worker_state(prepared_model, wstate)
+        # worker_states = [f.result() if f is not None else None for f in futures]
+
+        # for req, wstate, (_, _, doc_id) in zip(batch, worker_states, items, strict=True):
+        #     if wstate is not None:
+        #         merge_worker_state(prepared_model, wstate)
+        for req, result, (_, _, doc_id) in zip(batch, worker_results, items, strict=True):
+            if result is not None:
+                state_dict, losses = result
+                merge_worker_state(prepared_model, state_dict)
+                # TODO: log `losses` to wandb here (Fix 1 in the plan)
+                # Log per-step warmup losses in submission order so wandb's global
+                # step axis stays monotonic across concurrent workers.
+                # try:
+                #     import wandb
+                #     if wandb.run is not None:
+                #         step = getattr(prepared_model, "_ttw_wandb_step_global", 0)
+                #         for loss in losses:
+                #             wandb.log({"ttw_warmup/loss": loss}, step=step)
+                #             step += 1
+                #         prepared_model._ttw_wandb_step_global = step
+                # except ImportError:
+                #     pass
+
+                _log_ttw_warmup_losses(
+                    losses,
+                    image_idx=doc_id if doc_id is not None else -1,
+                    wandb_step_ref=prepared_model._ttw_wandb_step_ref,
+                )
+
             log_gpu_memory(
                 "generate_until: after warmup (before inference)",
                 doc_id=doc_id,
@@ -663,8 +707,6 @@ class TTWModel:
 
         processor = self._base.processor
         rank = getattr(self._base, "rank", 0)
-        world_size = getattr(self._base, "world_size", 1)
-        device = next(model.parameters()).device
         model_dtype = getattr(self._base.model, "dtype", torch.bfloat16)
         train_dataset = self._build_warmup_training_dataset(image, warmup_captions)
         output_dir = os.path.join("logs", "ttw_trainer", f"rank{rank}")
@@ -713,16 +755,13 @@ class TTWModel:
                     train_result = unsloth_train(trainer)
                 else:
                     train_result = trainer.train()
-            if hasattr(train_result, "training_loss"):
-                global_step = getattr(self, "_ttw_wandb_step", 0)
-                _ttw_log_loss_to_wandb(
-                    float(train_result.training_loss),
-                    rank,
-                    world_size,
-                    global_step,
-                    device=device,
+            if hasattr(train_result, "training_loss") and not hasattr(self, "_ttw_wandb_step_ref"):
+                self._ttw_wandb_step_ref = [0]
+                _log_ttw_warmup_losses(
+                    [float(train_result.training_loss)],
+                    image_idx=doc_id if doc_id is not None else -1,
+                    wandb_step_ref=self._ttw_wandb_step_ref,
                 )
-                self._ttw_wandb_step = global_step + 1
             _log_gpu_memory("TTW warmup: after trainer.train", doc_id=doc_id, rank=rank)
         finally:
             del trainer
@@ -771,8 +810,6 @@ class TTWModel:
         rank = getattr(self._base, "rank", 0)
         _log_gpu_memory("TTW warmup: before training loop", doc_id=doc_id, rank=rank)
 
-        device = next(model.parameters()).device
-        world_size = getattr(self._base, "world_size", 1)
         use_grad_accum = self.ttw_grad_accum
         with torch.enable_grad(), torch.autocast("cuda", dtype=model_dtype):
             for epoch in range(self.ttw_epochs):
@@ -847,15 +884,21 @@ class TTWModel:
                         start // self.ttw_batch_size + 1,
                         step_loss,
                     )
-                    global_step = getattr(self, "_ttw_wandb_step", 0)
-                    _ttw_log_loss_to_wandb(
-                        step_loss,
-                        self._base.rank,
-                        world_size,
-                        global_step,
-                        device=device,
+
+                    # collect losses per image, log once at the end
+                    # Initialize at the top of _run_warmup_optimization:
+                    losses_for_image: list[float] = []
+                    losses_for_image.append(step_loss)
+
+                    # After both epoch loops finish
+                    if not hasattr(self, "_ttw_wandb_step_ref"):
+                        self._ttw_wandb_step_ref = [0]
+                    _log_ttw_warmup_losses(
+                        losses_for_image,
+                        image_idx=doc_id if doc_id is not None else -1,
+                        wandb_step_ref=self._ttw_wandb_step_ref,
                     )
-                    self._ttw_wandb_step = global_step + 1
+
                     torch.cuda.empty_cache()
                 if epoch == 0:
                     _log_gpu_memory(

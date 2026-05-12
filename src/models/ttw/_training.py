@@ -17,9 +17,8 @@ from typing import Any
 
 import torch
 from PIL import Image
+from transformers import TrainerCallback
 from transformers.processing_utils import ProcessorMixin
-
-# ── Data collator ────────────────────────────────────────────────────────
 
 
 class TTWVisionDataCollator:
@@ -87,9 +86,6 @@ class TTWVisionDataCollator:
         return batch
 
 
-# ── Gradient checkpointing ───────────────────────────────────────────────
-
-
 def enable_gradient_checkpointing(model: torch.nn.Module) -> dict[str, Any]:
     """Enable checkpointing in the FSDP-safe non-reentrant mode."""
     from src.utils import get_logger
@@ -106,7 +102,37 @@ def disable_gradient_checkpointing(model: torch.nn.Module) -> dict[str, Any]:
         model.gradient_checkpointing_disable()
 
 
-# ── Dataset construction ─────────────────────────────────────────────────
+class TTWWarmupWandbCallback(TrainerCallback):
+    """Logs per-step TTW warmup loss to an existing ``wandb.run``.
+
+    The SFTConfig uses ``report_to="none"`` so the trainer itself does not
+    create a wandb run.  This callback bridges the gap by writing to the
+    run that ``eval_model.py`` already initialised on rank 0.
+
+    ``step_offset`` lets multiple images share a monotonically-increasing
+    x-axis across separate ``SFTTrainer`` instances.
+    """
+
+    def __init__(self, step_offset: int = 0) -> None:
+        self.step_offset = step_offset
+
+    def on_log(self, state: dict[str, Any], logs: dict[str, Any] | None = None, **kwargs) -> None:
+        """Log the loss to wandb."""
+        if logs is None:
+            return
+        loss = logs.get("loss")
+        if loss is None:
+            return
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.log(
+                    {"ttw_warmup/loss": loss},
+                    step=self.step_offset + state.global_step,
+                )
+        except ImportError:
+            pass
 
 
 def build_warmup_training_dataset(
@@ -131,9 +157,6 @@ def build_warmup_training_dataset(
         {"messages": format_chat_fn(image, prompt_text, caption_text)}
         for prompt_text, caption_text in warmup_captions
     ]
-
-
-# ── Trainer configuration ────────────────────────────────────────────────
 
 
 def build_trainer_config(
