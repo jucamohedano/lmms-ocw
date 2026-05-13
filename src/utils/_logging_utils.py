@@ -37,7 +37,9 @@ def get_logger(name: str = __name__, rank_zero_only: bool = False) -> logging.Lo
         ) -> "Callable | None":
             rank = getattr(rank_zero_only_fn, "rank", None)
             if rank is None:
-                rank_zero_only_fn.rank = os.getenv("LOCAL_RANK", 0)
+                # rank_zero_only_fn.rank = os.getenv("LOCAL_RANK", "0")
+                rank = int(os.getenv("LOCAL_RANK", "0"))  # ← coerce to int
+                rank_zero_only_fn.rank = rank
 
             # Add the rank to the extra kwargs
             extra = inner_kwargs.pop("extra", {})
