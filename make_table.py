@@ -1,8 +1,8 @@
 import argparse
 import glob
 import json
+import os
 from pathlib import Path
-
 import pandas as pd
 from tabulate import tabulate
 
@@ -14,13 +14,14 @@ def get_args():
     parser.add_argument("--model", required=False, help="Model name", default=None)
     parser.add_argument("--root", required=False, help="Root directory for logs", default="logs/schedule")
     parser.add_argument("--exclude", required=False, help="Exclude certain experiments", default=None)
+    parser.add_argument("--cross-methods", action="store_true", help="Generate cross-method comparison tables for finetuning methods")
 
     args = parser.parse_args()
 
     return args
 
 
-def load_results(experiment_name: str, model: str | None, exclude: str | None):
+def load_results(experiment_name: str, model: str = None, exclude: str = None):
     # Scan for folders of experiments and sort them by name
     _all = False
     if experiment_name == "all":
@@ -28,8 +29,13 @@ def load_results(experiment_name: str, model: str | None, exclude: str | None):
         _all = True
 
     if model is None:
-        folders = sorted(glob.glob(f"{args.root}/*{experiment_name}"))
-        print(f"{args.root}/*{experiment_name}")
+        # Look for any model subdirectories
+        folders = []
+        for exp_folder in sorted(glob.glob(f"{args.root}/*{experiment_name}")):
+            if os.path.isdir(exp_folder):
+                model_folders = sorted(glob.glob(f"{exp_folder}/*"))
+                folders.extend(model_folders)
+        print(f"{args.root}/*{experiment_name} (with models)")
     else:
         folders = sorted(glob.glob(f"{args.root}/*{experiment_name}/{model}"))
         print(f"{args.root}/*{experiment_name}/{model}")
@@ -73,12 +79,12 @@ def load_results(experiment_name: str, model: str | None, exclude: str | None):
     for experiment_folder in folders:
         # Get the last file in ascending order, i.e., the most recent one
         # so that we load the most recent experiment for current task
-        last_file = sorted(glob.glob(f"{experiment_folder}/*.json"))[-1]
+        last_file = sorted(glob.glob(f"{experiment_folder}/**/*.json", recursive=True))[-1]
         file_name = Path(last_file).name
         experiment_file_name = file_name.split(".")[0].replace("_results", "")
 
         # Do the same for the samples file, to ensure they match
-        last_file_samples = sorted(glob.glob(f"{experiment_folder}/*.jsonl"))[-1]
+        last_file_samples = sorted(glob.glob(f"{experiment_folder}/**/*.jsonl", recursive=True))[-1]
         file_samples_name = Path(last_file_samples).name
         samples_file_name = file_samples_name[: file_samples_name.find("_samples")]
 
@@ -128,9 +134,11 @@ def load_results(experiment_name: str, model: str | None, exclude: str | None):
 
         if "perplexity,none" in experiment["results"][experiment_name]:
             perplexity = experiment["results"][experiment_name]["perplexity,none"]
+        elif "avg_perplexity,none" in experiment["results"][experiment_name]:
+            perplexity = experiment["results"][experiment_name]["avg_perplexity,none"]
         else:
             # Compute average perplexity
-            perplexity = [x.get("perplexity", 0) for x in samples]
+            perplexity = [x.get("perplexity", x.get("avg_perplexity", 0)) for x in samples]
             perplexity = sum(perplexity) / len(perplexity)
 
         # Store results
@@ -166,7 +174,7 @@ def load_results(experiment_name: str, model: str | None, exclude: str | None):
     return data
 
 
-def results_by_group(data: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def results_by_group(data):
     dataset_groups = {
         "prototypical": [
             "caltech101", "sun397"
@@ -298,6 +306,81 @@ def rename_cols(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def main(args):
+    if args.cross_methods:
+        methods = ["vanilla_zero_shot", "ttw_full", "ttw_lora", "ttw_svf"]
+        print(f"\n===== Cross-Method Comparison =====")
+        print(f"Aggregating results for: {', '.join(methods)}")
+
+        all_data = []
+        for method in methods:
+            try:
+                curr_model = args.model
+                if method == "vanilla_zero_shot" and curr_model is not None and curr_model.endswith("-ttw"):
+                    curr_model = curr_model.replace("-ttw", "")
+
+                method_data = load_results(method, curr_model, args.exclude)
+                if not method_data.empty:
+                    method_data["Method"] = method
+                    all_data.append(method_data)
+            except Exception as e:
+                print(f"Warning: skipping method '{method}': {e}")
+
+        if len(all_data) == 0:
+            print("No data found for the specified methods.")
+            return
+
+        combined_df = pd.concat(all_data, ignore_index=True)
+
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+
+        def make_pivot(metric, metric_name, is_percentage=True, higher_is_better=True):
+            if metric not in combined_df.columns:
+                return
+
+            pivot_df = combined_df.pivot(index="Method", columns="experiment", values=metric)
+
+            # Reorder rows to match the defined methods list
+            valid_methods = [m for m in methods if m in pivot_df.index]
+            pivot_df = pivot_df.loc[valid_methods]
+
+            # Scale to 100 for percentage metrics and round
+            def format_val(x):
+                if pd.isna(x):
+                    return "-"
+                val = float(x)
+                if is_percentage:
+                    val *= 100
+                return round(val, 1)
+
+            try:
+                pivot_df = pivot_df.map(format_val)
+            except AttributeError:
+                pivot_df = pivot_df.applymap(format_val)
+
+            pivot_df.reset_index(inplace=True)
+
+            # Bold the best value in each column (excluding Method)
+            for col in pivot_df.columns[1:]:
+                vals = pivot_df[col].replace("-", pd.NA).dropna()
+                if len(vals) == 0:
+                    continue
+                vals = vals.astype(float)
+                best = vals.max() if higher_is_better else vals.min()
+                pivot_df[col] = pivot_df[col].apply(
+                    lambda x, b=best: f"{BOLD}{x}{RESET}" if x != "-" and float(x) == b else x
+                )
+
+            print(f"\n--- {metric_name} ---")
+            print(tabulate(pivot_df, headers="keys", tablefmt="fancy_grid", showindex=False))
+
+        make_pivot("textual_inclusion", "Textual Inclusion (Txt Incl)")
+        make_pivot("semantic_similarity", "Semantic Similarity (Sem Sim)")
+        make_pivot("concept_semantic_similarity", "Concept Semantic Similarity (Con Sim)")
+        make_pivot("median_concept_semantic_similarity", "Median Concept Semantic Similarity (Median CS)")
+        make_pivot("perplexity", "Perplexity", is_percentage=False, higher_is_better=False)
+        return
+
     data = load_results(args.experiment_name, args.model, args.exclude)
     try:
         data_by_group = results_by_group(data)

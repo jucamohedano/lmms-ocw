@@ -747,8 +747,8 @@ def avg_perplexity(
     )
 
     if len(perplexities) == 0:
-        return {"perplexity": 0.0}
+        return {"avg_perplexity": 0.0}
 
     # np.mean should be enough since None objects are filtered out when constructing
     # ctx_lengths, but keeping np.nanmean for safety
-    return {"perplexity": np.nanmean(perplexities)}
+    return {"avg_perplexity": np.nanmean(perplexities)}

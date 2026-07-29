@@ -222,6 +222,16 @@ def _run_single_evaluation(args: argparse.Namespace) -> tuple[dict, dict] | tupl
 
     datetime_str = args.datetime_str
 
+    if getattr(args, "ttw_offline_generate", False):
+        from src.utils.ttw_offline import generate_offline_captions
+
+        return generate_offline_captions(args, task_manager, task_names)
+
+    if getattr(args, "ttw_grpo_generate", False):
+        from src.utils.ttw_offline import generate_grpo_dataset
+
+        return generate_grpo_dataset(args, task_manager, task_names)
+
     results = simple_evaluate(
         model_name=args.model,
         model_args=args.model_args,
@@ -291,16 +301,72 @@ def main(args: argparse.Namespace) -> None:
         print("└────────────────────────────────────────────────────────────────────────────────┘")
         sys.exit(1)
 
-    if args.wandb_args:
-        if "name" not in args.wandb_args:
-            name = (
-                f"{args.model}_{args.model_args}_{utils.get_datetime_str(timezone=args.timezone)}"
-            )
-            name = utils.sanitize_long_string(name)
-            args.wandb_args += f",name={name}"
-        wandb_logger = WandbLogger(**utils.parse_string_args(args.wandb_args))
+    # Only rank 0 initializes WandB to avoid duplicate runs and teardown hangs
+    # on non-main ranks. TTW only needs a lightweight run for warmup-loss logging.
+    _is_rank_zero = os.environ.get("LOCAL_RANK", "0") == "0"
+    wandb_logger = None
+    wandb_run = None
+    model_args_parsed = utils.parse_string_args(args.model_args or "")
+    is_ttw_run = "ttw_finetune_method" in model_args_parsed
+    if args.wandb_args and _is_rank_zero:
+        wandb_kwargs = utils.parse_string_args(args.wandb_args)
+        if "name" not in wandb_kwargs:
+            ttw_method = model_args_parsed.get("ttw_finetune_method", "")
+            tasks_slug = (args.tasks or "unknown").replace(",", "_")[:64]
+            name_parts = [args.model, tasks_slug]
+            if ttw_method:
+                name_parts.append(ttw_method)
+            name_parts.append(utils.get_datetime_str(timezone=args.timezone))
+            name = utils.sanitize_long_string("_".join(filter(None, name_parts)))
+            wandb_kwargs["name"] = name
+        wandb_config = {
+            "model": args.model,
+            "tasks": args.tasks,
+            "model_args": args.model_args,
+            "batch_size": args.batch_size,
+            "limit": args.limit,
+            "seed": args.seed,
+        }
+        ttw_keys = [
+            "ttw_finetune_method",
+            "ttw_lora_backend",
+            "ttw_svf_rank",
+            "ttw_lr",
+            "ttw_epochs",
+            "ttw_batch_size",
+            "ttw_num_candidates",
+            "ttw_caption_temperature",
+            "ttw_max_new_tokens",
+            "ttw_grad_accum",
+            "ttw_concurrent_warmups",
+        ]
+        for key in ttw_keys:
+            if key in model_args_parsed:
+                wandb_config[key] = model_args_parsed[key]
+        wandb_kwargs["config"] = wandb_config
 
-    # Reset logger
+        if is_ttw_run:
+            wandb_kwargs["mode"] = os.environ.get(
+                "WANDB_MODE", wandb_kwargs.get("mode", "offline")
+            )
+
+        wandb_logger = WandbLogger(**wandb_kwargs)
+        #     import wandb
+
+        #     wandb_kwargs["mode"] = os.environ.get(
+        #         "WANDB_MODE", wandb_kwargs.get("mode", "offline")
+        #     )
+        #     wandb_run = wandb.init(**wandb_kwargs)
+        # else:
+        #     wandb_logger = WandbLogger(**wandb_kwargs)
+
+    # Set logging level from CLI argument
+    eval_logger_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(level=eval_logger_level)
+    # Silence noisy third-party loggers even when our code runs at DEBUG.
+    for noisy in ("PIL", "fsspec", "urllib3", "matplotlib", "filelock"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    log.setLevel(eval_logger_level)
     log.info("Log level set to %s", args.log_level)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -339,7 +405,7 @@ def main(args: argparse.Namespace) -> None:
             results_list.append(results)
 
             accelerator.wait_for_everyone()
-            if is_main_process and args.wandb_args:
+            if is_main_process and wandb_logger is not None:
                 try:
                     wandb_logger.post_init(results)
                     wandb_logger.log_eval_result()
@@ -371,8 +437,10 @@ def main(args: argparse.Namespace) -> None:
             if "groups" in results:
                 print(utils.make_table(results, "groups"))
 
-    if args.wandb_args:
+    if wandb_logger is not None:
         wandb_logger.run.finish()
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
@@ -582,6 +650,70 @@ if __name__ == "__main__":
         "--process_with_media",
         action="store_true",
         help="Whether you will process you dataset with audio, image.",
+    )
+    ttw_group = parser.add_mutually_exclusive_group()
+    ttw_group.add_argument(
+        "--ttw_offline_generate",
+        action="store_true",
+        help="If set, skips evaluation and generates TTW caption datasets offline.",
+    )
+    ttw_group.add_argument(
+        "--ttw_grpo_generate",
+        action="store_true",
+        help="If set, generates verl-compatible GRPO parquet datasets (no model inference).",
+    )
+    parser.add_argument(
+        "--ttw_use_vllm",
+        action="store_true",
+        help="If set, uses vLLM instead of HuggingFace for faster offline caption generation.",
+    )
+    parser.add_argument(
+        "--ttw_offline_num_candidates",
+        type=int,
+        default=10,
+        help="Number of candidates per prompt for offline generation.",
+    )
+    parser.add_argument(
+        "--ttw_offline_temperature",
+        type=float,
+        default=0.75,
+        help="Temperature for generative candidates.",
+    )
+    parser.add_argument(
+        "--ttw_offline_max_new_tokens",
+        type=int,
+        default=128,
+        help="Max new tokens for generative candidates.",
+    )
+    parser.add_argument(
+        "--ttw_offline_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for generating candidates offline.",
+    )
+    parser.add_argument(
+        "--ttw_offline_limit",
+        type=int,
+        default=None,
+        help="Limit offline captions. Separate from --limit for standard eval.",
+    )
+    parser.add_argument(
+        "--ttw_offline_vanilla_chat",
+        action="store_true",
+        help=(
+            "With --ttw_offline_generate: use a short default system prompt "
+            '("You are a helpful assistant.") instead of the GRPO scratchpad system prompt.'
+        ),
+    )
+    parser.add_argument(
+        "--ttw_grpo_prompt_config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a YAML file with 'system_prompt' and 'user_prompt' keys "
+            "for --ttw_grpo_generate. See configs/grpo_prompts/ for examples. "
+            "When omitted, uses the built-in reward v3 prompt."
+        ),
     )
     args = parser.parse_args()
 

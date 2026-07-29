@@ -1,4 +1,5 @@
 import json
+import os
 from copy import deepcopy
 from typing import Any
 
@@ -179,6 +180,22 @@ class WandbLogger:
             table = make_table(["Groups"] + columns, "groups")
             self.run.log({"evaluation/group_eval_results": table})
 
+    # def _log_results_as_artifact(self) -> None:
+    #     """Log results as JSON artifact to W&B."""
+    #     from wandb import Artifact
+
+    #     dumped = json.dumps(
+    #         self.results,
+    #         indent=2,
+    #         default=utils.convert_non_serializable,
+    #         ensure_ascii=False,
+    #     )
+    #     artifact = Artifact("results", type="eval_results")
+    #     with artifact.new_file("results.json", mode="w", encoding="utf-8") as f:
+    #         f.write(dumped)
+    #     self.run.log_artifact(artifact)
+    import os  # add to imports at top
+
     def _log_results_as_artifact(self) -> None:
         """Log results as JSON artifact to W&B."""
         from wandb import Artifact
@@ -189,9 +206,15 @@ class WandbLogger:
             default=utils.convert_non_serializable,
             ensure_ascii=False,
         )
-        artifact = Artifact("results", type="eval_results")
-        with artifact.new_file("results.json", mode="w", encoding="utf-8") as f:
+
+        # Write to the wandb run directory (durable across offline → sync) instead
+        # of letting `Artifact.new_file` stage to /tmp, which doesn't survive job exit.
+        results_path = os.path.join(self.run.dir, "results.json")
+        with open(results_path, "w", encoding="utf-8") as f:
             f.write(dumped)
+
+        artifact = Artifact("results", type="eval_results")
+        artifact.add_file(results_path)
         self.run.log_artifact(artifact)
 
     def log_eval_result(self) -> None:
@@ -289,28 +312,23 @@ class WandbLogger:
         return pd.DataFrame(df_data)
 
     def _log_samples_as_artifact(self, data: list[dict[str, Any]], task_name: str) -> None:
-        """Log evaluation samples as a W&B Artifact.
-
-        Args:
-        ----
-            data (List[Dict[str, Any]]): The evaluation samples.
-            task_name (str): The name of the task.
-
-        """
+        """Log evaluation samples as a W&B Artifact."""
         from wandb import Artifact
 
-        # log the samples as an artifact
         dumped = json.dumps(
             data,
             indent=2,
             default=utils.convert_non_serializable,
             ensure_ascii=False,
         )
-        artifact = Artifact(f"{task_name}", type="samples_by_task")
-        with artifact.new_file(f"{task_name}_eval_samples.json", mode="w", encoding="utf-8") as f:
+
+        samples_path = os.path.join(self.run.dir, f"{task_name}_eval_samples.json")
+        with open(samples_path, "w", encoding="utf-8") as f:
             f.write(dumped)
+
+        artifact = Artifact(f"{task_name}", type="samples_by_task")
+        artifact.add_file(samples_path)
         self.run.log_artifact(artifact)
-        # artifact.wait()
 
     def log_eval_samples(self, samples: dict[str, list[dict[str, Any]]]) -> None:
         """Log evaluation samples to W&B.

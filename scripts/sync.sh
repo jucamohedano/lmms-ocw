@@ -41,6 +41,8 @@ main() {
         "*.db"
         "/notebooks/"
         "/plots/"
+        "tests/"
+        "/arch_outputs/"
     )
 
     # Read remotes from configuration file
@@ -72,8 +74,19 @@ main() {
         [[ -z "$remote" || "$remote" =~ ^[[:space:]]*# ]] && continue
         echo "[info] Syncing $remote/logs/ to $(pwd)/logs ..."
         rsync --update -azhv "${logs_exclude_opts[@]}" "$remote/logs/" "./logs/"
-    done < "$config_file"
 
+        echo "[info] Syncing $remote/offline_captions/ to $(pwd)/offline_captions ..."
+        rsync --update -azhv \
+            "$remote/offline_captions/" "./offline_captions/"
+    done < "$config_file"
+    # while IFS= read -r remote || [ -n "$remote" ]; do
+    #     # Skip empty lines and comments
+    #     [[ -z "$remote" || "$remote" =~ ^[[:space:]]*# ]] && continue
+    #     echo "[info] Syncing $remote/logs/ to $(pwd)/logs ..."
+    #     rsync --update -azhv "${logs_exclude_opts[@]}" "$remote/logs/" "./logs/"
+    #     echo "[info] Syncing $remote/arch_outputs/ to $(pwd)/arch_outputs ..."
+    #     rsync --update -azhv "$remote/arch_outputs/" "./arch_outputs/"
+    # done < "$config_file"
 }
 
 main "$@"

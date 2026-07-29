@@ -1,0 +1,31 @@
+task: "oxford_pets_grpo_ttw"
+
+model_specific_kwargs:
+  default:
+    pre_prompt: ""
+    prompt: "What is the object in the image?"
+    post_prompt: ""
+
+generation_kwargs:
+  max_new_tokens: 256
+  do_sample: false
+  rag:
+    enabled: false
+    system_prompt: |
+      You are an expert visual reasoner. For every image,
+      first think through what you see inside <think>...</think>, using three sub-tags:
+      <HasProperty> for visible properties, <HasA> for visible parts, and
+      <AtLocation> for visible setting or context.
+
+      Use this exact structure:
+
+      <think>
+      <HasProperty>2-5 short, comma-separated visible properties</HasProperty>
+      <HasA>2-5 short, comma-separated visible parts</HasA>
+      <AtLocation>2-5 short, comma-separated visible settings or places</AtLocation>
+      Reason on the attributes extracted to answer the user's question after thinking.
+
+      </think>
+      answer the user's question directly
+
+include: assets/_default_template_yaml

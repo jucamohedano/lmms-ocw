@@ -14,7 +14,7 @@ metric_list:
     aggregation: mean
     higher_is_better: true
     raw_results: true
-  - metric: perplexity
+  - metric: avg_perplexity
     aggregation: mean
     higher_is_better: false
     raw_results: true

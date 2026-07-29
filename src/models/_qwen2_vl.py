@@ -2,15 +2,24 @@ import base64
 import copy
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
+from accelerate import DistributedType
 from PIL import Image
 from qwen_vl_utils import process_vision_info
-from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from transformers import AutoProcessor, AutoTokenizer
+from transformers.generation import (
+    LogitsProcessorList,
+    TemperatureLogitsWarper,
+    TopPLogitsWarper,
+)
 from transformers.utils import ModelOutput
 
 from src import utils
@@ -18,6 +27,7 @@ from src.data.tasks import TaskInstance, TaskSingleOutput
 from src.data.tasks._manager import ConfigurableTask
 from src.models._api import register_model
 from src.models._base import Model
+from src.models._qwen_vl_version import get_qwen_vl_model_class, is_qwen2_5_vl_checkpoint
 from src.retrieval import Retriever
 
 __all__ = ["Qwen2VL"]
@@ -38,6 +48,14 @@ def _flatten_list(input: list[list[Any]]) -> list[Any]:
         for j in i:
             new_list.append(j)
     return new_list
+
+
+@dataclass
+class _GenerateOutput(ModelOutput):
+    """Minimal generation output used by the FSDP-aware decode path."""
+
+    sequences: torch.LongTensor | None = None
+    scores: tuple[torch.FloatTensor, ...] | None = None
 
 
 class Qwen2VL(Model):
@@ -76,6 +94,11 @@ class Qwen2VL(Model):
         dtype: str | torch.dtype = "bfloat16",
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
+        compile: bool = True,
+        lora_backend: str = "peft",
+        ttw_finetune_method: str = "full",
+        ttw_lora_backend: str = "peft",
+        ttw_svf_rank: int = -1,
         **kwargs,
     ) -> None:
         self._model_name_or_path = model_name_or_path
@@ -84,6 +107,11 @@ class Qwen2VL(Model):
         self._max_pixels = max_pixels
         self._min_pixels = min_pixels
         self.batch_size_per_gpu = batch_size
+        self._compile = compile
+        self._lora_backend = str(lora_backend).lower()
+        self._ttw_finetune_method = str(ttw_finetune_method).lower()
+        self._ttw_lora_backend = str(ttw_lora_backend).lower()
+        self._ttw_svf_rank = int(ttw_svf_rank)
 
         if device_map == "None":
             device_map = None
@@ -98,8 +126,56 @@ class Qwen2VL(Model):
             **kwargs,
         )
 
+        log.info("Flash attention 2: %s", self._use_flash_attention_2)
+
     def load_model(self) -> None:
         """Load the model in memory."""
+        # Unsloth is incompatible with FSDP; use standard HF path when distributed.
+        use_unsloth_load = (
+            self._lora_backend == "unsloth"
+            and self.accelerator.distributed_type != DistributedType.FSDP
+        )
+        if not use_unsloth_load and self._lora_backend == "unsloth":
+            log.info(
+                "Unsloth requested but FSDP detected; loading standard HF model. "
+                "PEFT LoRA will be applied in _transform_model_before_prepare."
+            )
+        if use_unsloth_load:
+            import os
+
+            from unsloth import FastVisionModel
+
+            # Keep a dedicated Unsloth loading path instead of translating an
+            # already-loaded HF model into Unsloth expectations.
+            model_ref = self._model_name_or_path
+            if "/" in model_ref and not os.path.exists(model_ref):
+                try:
+                    from huggingface_hub import snapshot_download
+
+                    model_ref = snapshot_download(
+                        repo_id=self._model_name_or_path,
+                        local_files_only=True,
+                    )
+                    log.info("Resolved offline HF snapshot for Unsloth: %s", model_ref)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Unsloth backend requires a locally cached model snapshot. "
+                        f"Could not resolve '{self._model_name_or_path}' from local HF cache."
+                    ) from exc
+
+            self._model, self._processor = FastVisionModel.from_pretrained(
+                model_name=model_ref,
+                max_seq_length=2048,
+                dtype=None,
+                load_in_4bit=self._load_in_4bit,
+                device_map=self.device_map,
+            )
+            # Unsloth returns a processor; keep tokenizer API compatibility
+            # expected by generate_until (e.g., tokenizer.encode).
+            self._tokenizer = getattr(self._processor, "tokenizer", self._processor)
+            log.info("Loaded model with Unsloth backend.")
+            return
+
         model_kwargs = {
             "torch_dtype": self.dtype,
             "device_map": self.device_map,
@@ -114,28 +190,106 @@ class Qwen2VL(Model):
         if self._quantization_config is not None:
             model_kwargs["quantization_config"] = self._quantization_config
 
-        PretrainedModel = Qwen2VLForConditionalGeneration
-        if "Qwen2.5" in self._model_name_or_path:
-            try:
-                from transformers import Qwen2_5_VLForConditionalGeneration
-            except ImportError as e:
-                raise ValueError(
-                    "Failed to import Qwen2_5_VLForConditionalGeneration."
-                    " Please upgrade transformers to a later version."
-                ) from e
-
-            PretrainedModel = Qwen2_5_VLForConditionalGeneration
+        is_qwen2_5_vl = is_qwen2_5_vl_checkpoint(self._model_name_or_path)
+        PretrainedModel = get_qwen_vl_model_class(self._model_name_or_path)
 
         self._model = PretrainedModel.from_pretrained(self._model_name_or_path, **model_kwargs)
-        self._model = torch.compile(self._model, mode="max-autotune", fullgraph=True)
+        if self._compile:
+            self._model = torch.compile(self._model, mode="max-autotune", fullgraph=True)
         self._processor = AutoProcessor.from_pretrained(
             self._model_name_or_path, **processor_kwargs
         )
         self._tokenizer = AutoTokenizer.from_pretrained(self._model_name_or_path)
 
-        if "Qwen2.5" in self._model_name_or_path:
+        if is_qwen2_5_vl:
             self._processor.tokenizer.padding_side = "left"
             self._tokenizer.padding_side = "left"
+
+    def _transform_model_before_prepare(self) -> None:
+        """Apply SVF or LoRA adapters before accelerator.prepare() for FSDP compatibility."""
+        if self._ttw_finetune_method == "svf":
+            from src.models.apply_svf_to_llm import apply_svf_to_llm
+
+            self._svf_layers = apply_svf_to_llm(self._model, rank=self._ttw_svf_rank)
+            log.info("Applied SVF to model (rank=%d) before FSDP prepare.", self._ttw_svf_rank)
+        elif self._ttw_finetune_method == "lora":
+            backend = self._ttw_lora_backend
+            use_fsdp = self.accelerator.distributed_type == DistributedType.FSDP
+            if use_fsdp and backend == "unsloth":
+                log.info("Unsloth requested but FSDP detected; applying PEFT LoRA instead.")
+                backend = "peft"
+            self._ttw_lora_backend = backend
+            if backend == "unsloth":
+                self._apply_lora_unsloth()
+            else:
+                self._apply_lora_peft()
+        elif self._ttw_finetune_method != "full":
+            raise ValueError(
+                f"Unknown ttw_finetune_method '{self._ttw_finetune_method}'. "
+                "Expected one of: full, svf, lora."
+            )
+
+    def _apply_lora_peft(self) -> None:
+        """Attach LoRA adapters with PEFT (FSDP-compatible)."""
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError as exc:
+            raise ImportError(
+                "LoRA finetuning requested but PEFT is not installed. "
+                "Install with `pip install peft`."
+            ) from exc
+
+        from src.models.ttw._config import get_lora_config_dict
+
+        lora_config = LoraConfig(**get_lora_config_dict())
+        if hasattr(self._model, "enable_input_require_grads"):
+            self._model.enable_input_require_grads()
+        self._model = get_peft_model(self._model, lora_config)
+        log.info("Applied PEFT LoRA adapters before FSDP prepare.")
+
+    def _apply_lora_unsloth(self) -> None:
+        """Attach LoRA adapters with Unsloth (single-GPU only; not FSDP-compatible)."""
+        try:
+            from unsloth import FastVisionModel
+        except ImportError:
+            log.warning(
+                "Unsloth requested for TTW LoRA but package not available. "
+                "Falling back to PEFT."
+            )
+            self._ttw_lora_backend = "peft"
+            self._apply_lora_peft()
+            return
+
+        try:
+            if hasattr(self._model, "enable_input_require_grads"):
+                self._model.enable_input_require_grads()
+            self._model = FastVisionModel.get_peft_model(
+                self._model,
+                finetune_vision_layers=False,
+                finetune_language_layers=True,
+                finetune_attention_modules=True,
+                finetune_mlp_modules=True,
+                r=16,
+                lora_alpha=32,
+                lora_dropout=0.05,
+                bias="none",
+                use_gradient_checkpointing="unsloth",
+                random_state=3407,
+                target_modules=[
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+            )
+            log.info("Applied Unsloth LoRA adapters (single-GPU path).")
+        except Exception as exc:
+            log.warning("Failed to apply Unsloth LoRA; falling back to PEFT. Reason: %s", exc)
+            self._ttw_lora_backend = "peft"
+            self._apply_lora_peft()
 
     def _log_conversation(self, conversation: list) -> None:
         """Log the given conversation in a readable format.
@@ -702,25 +856,143 @@ class Qwen2VL(Model):
         if "resize_input_image" in gen_kwargs:
             gen_kwargs.pop("resize_input_image")
 
-        pad_token_id = self.tokenizer.pad_token_id
+        generation_output = self._generate_from_inputs(inputs, gen_kwargs, output_scores=True)
 
-        generation_output = self.model.generate(
+        return inputs, generation_output
+
+    def _generate_with_hf_generate(
+        self, inputs: dict, gen_kwargs: dict, *, output_scores: bool
+    ) -> ModelOutput | torch.Tensor:
+        """Use the stock HF generate path on the unwrapped model."""
+        return self.model.generate(
             **inputs,
             eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=pad_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
             do_sample=gen_kwargs["temperature"] > 0,
             temperature=gen_kwargs["temperature"],
             top_p=gen_kwargs["top_p"],
             num_beams=gen_kwargs["num_beams"],
             max_new_tokens=gen_kwargs["max_new_tokens"],
             use_cache=self._use_cache,
-            return_dict_in_generate=True,
-            output_scores=True,
-            output_logits=True,  # In our case, with temp == 0, they should
-            # be identical to scores
+            return_dict_in_generate=output_scores,
+            output_scores=output_scores,
         )
 
-        return inputs, generation_output
+    def _generate_with_fsdp_forward(
+        self, inputs: dict, gen_kwargs: dict, *, output_scores: bool
+    ) -> _GenerateOutput | torch.Tensor:
+        """Run token-by-token generation while keeping forward passes inside FSDP."""
+        prepared_model = self._get_prepared_model()
+        base_model = self.model
+
+        if gen_kwargs["num_beams"] != 1:
+            log.warning(
+                "FSDP-aware generation currently supports num_beams=1 only; "
+                "falling back to summon_full_params()."
+            )
+            with FSDP.summon_full_params(prepared_model):
+                return self._generate_with_hf_generate(
+                    inputs, gen_kwargs, output_scores=output_scores
+                )
+
+        input_ids = inputs["input_ids"]
+        model_kwargs = {key: value for key, value in inputs.items() if key != "input_ids"}
+        model_kwargs["use_cache"] = self._use_cache
+        model_kwargs = base_model._get_initial_cache_position(
+            input_ids.shape[1],
+            input_ids.device,
+            model_kwargs,
+        )
+
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None:
+            eos_token_ids = None
+            eos_token_tensor = None
+        elif isinstance(eos_token_id, int):
+            eos_token_ids = [eos_token_id]
+            eos_token_tensor = torch.tensor(eos_token_ids, device=input_ids.device)
+        else:
+            eos_token_ids = list(eos_token_id)
+            eos_token_tensor = torch.tensor(eos_token_ids, device=input_ids.device)
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = eos_token_ids[0] if eos_token_ids else 0
+
+        sequences = input_ids
+        score_steps: list[torch.Tensor] = []
+        unfinished = torch.ones(sequences.shape[0], dtype=torch.bool, device=sequences.device)
+        do_sample = gen_kwargs["temperature"] > 0
+        temperature = max(float(gen_kwargs["temperature"]), 1e-5) if do_sample else None
+        top_p = gen_kwargs["top_p"]
+
+        warpers = LogitsProcessorList()
+        if do_sample:
+            warpers.append(TemperatureLogitsWarper(temperature))
+            if top_p is not None and 0.0 < top_p < 1.0:
+                warpers.append(TopPLogitsWarper(top_p))
+
+        for _ in range(gen_kwargs["max_new_tokens"]):
+            model_inputs = base_model.prepare_inputs_for_generation(sequences, **model_kwargs)
+            outputs = prepared_model(**model_inputs, return_dict=True)
+            next_token_scores = outputs.logits[:, -1, :].float()
+
+            if do_sample:
+                sampling_scores = warpers(sequences, next_token_scores)
+                probs = torch.softmax(sampling_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                stored_scores = sampling_scores
+            else:
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+                stored_scores = next_token_scores
+
+            if eos_token_tensor is not None:
+                next_tokens = torch.where(
+                    unfinished,
+                    next_tokens,
+                    torch.full_like(next_tokens, pad_token_id),
+                )
+
+            sequences = torch.cat([sequences, next_tokens[:, None]], dim=-1)
+            if output_scores:
+                score_steps.append(stored_scores)
+
+            model_kwargs = base_model._update_model_kwargs_for_generation(
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=base_model.config.is_encoder_decoder,
+                num_new_tokens=1,
+            )
+
+            if eos_token_tensor is not None:
+                unfinished = unfinished & ~torch.isin(next_tokens, eos_token_tensor)
+                local_finished = torch.tensor(
+                    0 if unfinished.any() else 1,
+                    device=sequences.device,
+                )
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(local_finished, op=dist.ReduceOp.SUM)
+                    if local_finished.item() == dist.get_world_size():
+                        break
+                elif local_finished.item() == 1:
+                    break
+
+        if not output_scores:
+            return sequences
+        return _GenerateOutput(sequences=sequences, scores=tuple(score_steps))
+
+    def _generate_from_inputs(
+        self, inputs: dict, gen_kwargs: dict, *, output_scores: bool
+    ) -> ModelOutput | torch.Tensor:
+        """Route generation through an FSDP-aware path when the prepared model is sharded."""
+        prepared_model = self._get_prepared_model()
+        if isinstance(prepared_model, FSDP):
+            return self._generate_with_fsdp_forward(
+                inputs,
+                gen_kwargs,
+                output_scores=output_scores,
+            )
+        return self._generate_with_hf_generate(inputs, gen_kwargs, output_scores=output_scores)
 
     def _decode(self, inputs: dict, generation_output: ModelOutput) -> list[str]:
         """Decode the generated output into a list of strings.
@@ -890,14 +1162,15 @@ class Qwen2VL(Model):
             answers = self._decode(inputs, generation_output)
 
             for ans_idx, answer in enumerate(answers):
+                if "</think>" in answer:
+                    answer = answer.split("</think>")[-1]
+
                 if "Answer:" in answer:
-                    answers[ans_idx] = (
-                        answer.split("Answer:")[-1]
-                        .replace("[", "")
-                        .replace("]", "")
-                        .replace('"', "")
-                        .strip()
-                    )
+                    answer = answer.split("Answer:")[-1]
+
+                answers[ans_idx] = (
+                    answer.replace("[", "").replace("]", "").replace('"', "").strip()
+                )
 
             gen_metrics = self._loglikelihood(inputs, generation_output)
 
@@ -1879,6 +2152,150 @@ class Qwen2VL(Model):
         pbar.close()
         return res
 
+    # ------------------------------------------------------------------
+    # TTW interface — model-specific formatting for Test-Time Warmup
+    # ------------------------------------------------------------------
+
+    def ttw_generate_captions(
+        self,
+        image: Image.Image,
+        prompts: list[str],
+        num_candidates: int,
+        temperature: float,
+        max_new_tokens: int,
+        batch_size: int = 1,
+        *,
+        vanilla_chat: bool = False,
+    ) -> list[tuple[str, list[str]]]:
+        """Generate caption candidates for each prompt using this model's chat format.
+
+        Args:
+        ----
+            image: The input image.
+            prompts: List of auxiliary prompts to generate captions for.
+            num_candidates: Number of candidate captions per prompt.
+            temperature: Sampling temperature for generation.
+            max_new_tokens: Maximum new tokens to generate.
+            batch_size: Used for batching during internal token generation.
+            vanilla_chat: If True, use a short default system message instead
+            of the GRPO scratchpad prompt.
+
+        Returns:
+        -------
+            List of (prompt, [candidate_captions]) tuples.
+
+        """
+        results_map = {prompt: [] for prompt in prompts}
+
+        # Pre-compute formatted text for each unique prompt (avoids redundant
+        # ttw_format_chat + apply_chat_template calls across candidates)
+        formatted_texts = {}
+        for prompt in prompts:
+            msg = self.ttw_format_chat(image, prompt, vanilla_chat=vanilla_chat)
+            formatted_texts[prompt] = self.processor.apply_chat_template(
+                msg, tokenize=False, add_generation_prompt=True
+            )
+
+        # Flatten all (prompt, candidate_idx) pairs into a single list so we can
+        # chunk them into GPU-friendly batches. Total items = num_prompts * num_candidates.
+        # e.g. 10 prompts x 10 candidates = 100 flat requests.
+        flat_requests = [p for p in prompts for _ in range(num_candidates)]
+
+        # Process flat_requests in chunks of `batch_size`. Each chunk is tokenized
+        # into a single padded tensor and fed to model.generate() in one GPU call,
+        # producing `batch_size` captions simultaneously instead of sequentially.
+        for i in range(0, len(flat_requests), batch_size):
+            batch_prompts = flat_requests[i : i + batch_size]
+            batch_texts = [formatted_texts[p] for p in batch_prompts]
+
+            # Tokenize the entire batch into a single padded tensor.
+            # The same image is replicated for each item in the batch since
+            # all candidates share the same input image.
+            inputs = self.processor(
+                text=batch_texts,
+                images=[image] * len(batch_texts),
+                return_tensors="pt",
+                padding=True,
+            ).to("cuda")
+
+            # Single batched forward pass — generates all candidates in parallel
+            with torch.no_grad():
+                out = self._generate_from_inputs(
+                    inputs,
+                    {
+                        "temperature": temperature,
+                        "top_p": None,
+                        "num_beams": 1,
+                        "max_new_tokens": max_new_tokens,
+                    },
+                    output_scores=False,
+                )
+
+            # Decode generated tokens (strip input prefix) back to strings
+            batch_captions = self.processor.batch_decode(
+                out[:, inputs.input_ids.shape[1] :], skip_special_tokens=True
+            )
+
+            # Map each decoded caption back to its originating prompt
+            for prompt, caption in zip(batch_prompts, batch_captions, strict=True):
+                results_map[prompt].append(caption)
+
+        return [(prompt, results_map[prompt]) for prompt in prompts]
+
+    def ttw_format_chat(
+        self,
+        image: Image.Image,
+        prompt: str,
+        caption: str | None = None,
+        *,
+        vanilla_chat: bool = False,
+    ) -> list[dict]:
+        """Format a TTW chat message for this model's chat template.
+
+        Args:
+        ----
+            image: The input image.
+            prompt: The user prompt.
+            caption: Optional assistant caption. If provided, appends an assistant turn.
+            vanilla_chat: If True, use ``You are a helpful assistant.``
+            instead of the GRPO scratchpad system prompt.
+
+        Returns:
+        -------
+            List of message dicts ready for `apply_chat_template`.
+
+        """
+        system_text = "You are a helpful assistant." if vanilla_chat else utils._GRPO_SYSTEM_PROMPT
+        msg = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": system_text}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ]
+        if caption is not None:
+            msg.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": caption},
+                    ],
+                }
+            )
+        return msg
+
+    def ttw_get_vision_encoder(self) -> list[torch.nn.Module]:
+        """Return the vision encoder modules to be frozen."""
+        # We explicitly return the patch embed and the vision blocks,
+        # but we DO NOT return self.model.visual.merger (the connector)!
+        return [self.model.visual.patch_embed, self.model.visual.blocks]
+
 
 @register_model("qwen2-vl-7b")
 def qwen2_vl_7b(**model_kwargs) -> Model:
@@ -1899,7 +2316,7 @@ def qwen2_vl_2b(**model_kwargs) -> Model:
 @register_model("qwen2.5-vl-7b")
 def qwen25_vl_7b(**model_kwargs) -> Model:
     """Load the Qwen2.5VL model with 7B params."""
-    model_name_or_path = "Qwen/Qwen2.5-VL-7B-Instruct"
+    model_name_or_path = model_kwargs.pop("model_name_or_path", "Qwen/Qwen2.5-VL-7B-Instruct")
     model = Qwen2VL(model_name_or_path, **model_kwargs)
     return model
 
@@ -1918,3 +2335,140 @@ def qwen2_vl_mmrait(**model_kwargs) -> Model:
     model_name_or_path = "whalezzz/MM-RAIT-Qwen2-VL"
     model = Qwen2VL(model_name_or_path, **model_kwargs)
     return model
+
+
+from src.models.ttw import TTWModel  # noqa: E402, I001
+
+
+@register_model("qwen2-vl-2b-ttw")
+def qwen2_vl_2b_ttw(**model_kwargs) -> Model:
+    """Load Qwen2VL-2B with Test-Time Warmup."""
+    model_name_or_path = model_kwargs.pop("model_name_or_path", "Qwen/Qwen2-VL-2B-Instruct")
+    offline_caption_dir = model_kwargs.pop("offline_caption_dir", None)
+    ttw_lr = model_kwargs.pop("ttw_lr", 1e-6)
+    ttw_epochs = model_kwargs.pop("ttw_epochs", 2)
+    ttw_batch_size = model_kwargs.pop("ttw_batch_size", 5)
+    ttw_num_candidates = model_kwargs.pop("ttw_num_candidates", 10)
+    ttw_caption_temperature = model_kwargs.pop("ttw_caption_temperature", 0.75)
+    ttw_max_new_tokens = model_kwargs.pop("ttw_max_new_tokens", 128)
+    clip_model_name = model_kwargs.pop("clip_model_name", None)
+    ttw_finetune_method = model_kwargs.pop("ttw_finetune_method", "full")
+    ttw_lora_backend = model_kwargs.pop("ttw_lora_backend", "peft")
+    ttw_svf_rank = model_kwargs.pop("ttw_svf_rank", -1)
+    ttw_grad_accum = model_kwargs.pop("ttw_grad_accum", False)
+    ttw_concurrent_warmups = model_kwargs.pop("ttw_concurrent_warmups", 1)
+    base = Qwen2VL(
+        model_name_or_path,
+        compile=False,
+        lora_backend=ttw_lora_backend,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+        **model_kwargs,
+    )
+    return TTWModel(
+        base,
+        ttw_lr=ttw_lr,
+        ttw_epochs=ttw_epochs,
+        ttw_batch_size=ttw_batch_size,
+        ttw_num_candidates=ttw_num_candidates,
+        ttw_caption_temperature=ttw_caption_temperature,
+        ttw_max_new_tokens=ttw_max_new_tokens,
+        clip_model_name=clip_model_name,
+        offline_caption_dir=offline_caption_dir,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+        ttw_grad_accum=ttw_grad_accum,
+        ttw_concurrent_warmups=ttw_concurrent_warmups,
+    )
+
+
+@register_model("qwen2-vl-7b-ttw")
+def qwen2_vl_7b_ttw(**model_kwargs) -> Model:
+    """Load Qwen2VL-7B with Test-Time Warmup."""
+    model_name_or_path = model_kwargs.pop("model_name_or_path", "Qwen/Qwen2-VL-7B-Instruct")
+    offline_caption_dir = model_kwargs.pop("offline_caption_dir", None)
+    ttw_lr = model_kwargs.pop("ttw_lr", 1e-6)
+    ttw_epochs = model_kwargs.pop("ttw_epochs", 2)
+    ttw_batch_size = model_kwargs.pop("ttw_batch_size", 5)
+    ttw_num_candidates = model_kwargs.pop("ttw_num_candidates", 10)
+    ttw_caption_temperature = model_kwargs.pop("ttw_caption_temperature", 0.75)
+    ttw_max_new_tokens = model_kwargs.pop("ttw_max_new_tokens", 128)
+    clip_model_name = model_kwargs.pop("clip_model_name", None)
+    ttw_finetune_method = model_kwargs.pop("ttw_finetune_method", "full")
+    ttw_lora_backend = model_kwargs.pop("ttw_lora_backend", "peft")
+    ttw_svf_rank = model_kwargs.pop("ttw_svf_rank", -1)
+    ttw_compile = model_kwargs.pop("ttw_compile", False)
+    ttw_grad_accum = model_kwargs.pop("ttw_grad_accum", False)
+    ttw_concurrent_warmups = model_kwargs.pop("ttw_concurrent_warmups", 1)
+    base = Qwen2VL(
+        model_name_or_path,
+        compile=ttw_compile,
+        lora_backend=ttw_lora_backend,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+        **model_kwargs,
+    )
+    return TTWModel(
+        base,
+        ttw_lr=ttw_lr,
+        ttw_epochs=ttw_epochs,
+        ttw_batch_size=ttw_batch_size,
+        ttw_num_candidates=ttw_num_candidates,
+        ttw_caption_temperature=ttw_caption_temperature,
+        ttw_max_new_tokens=ttw_max_new_tokens,
+        clip_model_name=clip_model_name,
+        offline_caption_dir=offline_caption_dir,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+        ttw_grad_accum=ttw_grad_accum,
+        ttw_concurrent_warmups=ttw_concurrent_warmups,
+    )
+
+
+@register_model("qwen2.5-vl-7b-ttw")
+def qwen25_vl_7b_ttw(**model_kwargs) -> Model:
+    """Load Qwen2.5-VL-7B with Test-Time Warmup."""
+    model_name_or_path = model_kwargs.pop("model_name_or_path", "Qwen/Qwen2.5-VL-7B-Instruct")
+    offline_caption_dir = model_kwargs.pop("offline_caption_dir", None)
+    ttw_lr = model_kwargs.pop("ttw_lr", 1e-6)
+    ttw_epochs = model_kwargs.pop("ttw_epochs", 2)
+    ttw_batch_size = model_kwargs.pop("ttw_batch_size", 5)
+    ttw_num_candidates = model_kwargs.pop("ttw_num_candidates", 10)
+    ttw_caption_temperature = model_kwargs.pop("ttw_caption_temperature", 0.75)
+    ttw_max_new_tokens = model_kwargs.pop("ttw_max_new_tokens", 128)
+    clip_model_name = model_kwargs.pop("clip_model_name", None)
+    ttw_finetune_method = model_kwargs.pop("ttw_finetune_method", "full")
+    ttw_lora_backend = model_kwargs.pop("ttw_lora_backend", "peft")
+    ttw_svf_rank = model_kwargs.pop("ttw_svf_rank", -1)
+    ttw_compile = model_kwargs.pop("ttw_compile", False)
+    ttw_grad_accum = model_kwargs.pop("ttw_grad_accum", False)
+    ttw_concurrent_warmups = model_kwargs.pop("ttw_concurrent_warmups", 1)
+    base = Qwen2VL(
+        model_name_or_path,
+        compile=ttw_compile,
+        lora_backend=ttw_lora_backend,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+        **model_kwargs,
+    )
+    return TTWModel(
+        base,
+        ttw_lr=ttw_lr,
+        ttw_epochs=ttw_epochs,
+        ttw_batch_size=ttw_batch_size,
+        ttw_num_candidates=ttw_num_candidates,
+        ttw_caption_temperature=ttw_caption_temperature,
+        ttw_max_new_tokens=ttw_max_new_tokens,
+        clip_model_name=clip_model_name,
+        offline_caption_dir=offline_caption_dir,
+        ttw_finetune_method=ttw_finetune_method,
+        ttw_lora_backend=ttw_lora_backend,
+        ttw_svf_rank=ttw_svf_rank,
+        ttw_grad_accum=ttw_grad_accum,
+        ttw_concurrent_warmups=ttw_concurrent_warmups,
+    )

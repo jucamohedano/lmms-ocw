@@ -11,6 +11,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _results_json_path_for_samples_file(samples_path: Path) -> Path:
+    """Mirror lmms-eval layout: ``{task_stem}_samples.jsonl`` → ``{task_stem}_results.json``.
+
+    The previous heuristic (first two ``_``-separated parts) breaks for task names with more
+    segments, e.g. ``oxford_pets_grpo_ttw_samples.jsonl`` must map to
+    ``oxford_pets_grpo_ttw_results.json``, not ``oxford_pets_results.json``.
+    """
+    name = samples_path.name
+    parent = samples_path.parent
+    if name.endswith("_samples.jsonl"):
+        stem = name[: -len("_samples.jsonl")]
+        return parent / f"{stem}_results.json"
+    if "_" in name:
+        name_parts = name.split("_")
+        if len(name_parts) > 2 and name_parts[2].isdigit():
+            return parent / ("_".join(name_parts[:3]) + "_results.json")
+        return parent / ("_".join(name_parts[:2]) + "_results.json")
+    return parent / "results.json"
+
+
 from src import utils  # noqa: E402
 from src.data.metrics import get_metric_info  # noqa: E402
 
@@ -63,20 +83,7 @@ def main(args: Namespace) -> None:
         task_name = Path(input_file).parent.parent.name
         model_name = Path(input_file).parent.name
 
-        if "_" in Path(input_file).name:
-            name_parts = Path(input_file).name.split("_")
-
-            # Support for runs with a random number in the file name
-            if len(name_parts) > 2 and name_parts[2].isdigit():
-                result_file = Path(input_file).parent / (
-                    "_".join(name_parts[:3]) + "_results.json"
-                )
-            else:
-                result_file = Path(input_file).parent / (
-                    "_".join(name_parts[:2]) + "_results.json"
-                )
-        else:
-            result_file = Path(input_file).parent / "results.json"
+        result_file = _results_json_path_for_samples_file(Path(input_file))
         log.debug("Corresponding result file: %s", result_file)
 
         df = pd.read_json(input_file, lines=True)

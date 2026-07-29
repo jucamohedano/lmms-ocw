@@ -122,7 +122,9 @@ class Model(ABC):
             )
 
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
-        self.accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
+        self.accelerator = Accelerator(
+            kwargs_handlers=[accelerator_kwargs],
+        )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if self.accelerator.num_processes > 1:
@@ -143,6 +145,8 @@ class Model(ABC):
         self.load_model()
         if self._model is None:
             raise ValueError("The `load_model` method must set the attribute `_model`!")
+
+        self._transform_model_before_prepare()
 
         # Setup the accelerator
         if self.accelerator.num_processes > 1:
@@ -176,8 +180,12 @@ class Model(ABC):
                 log.info("Using %d devices with data parallelism", self.accelerator.num_processes)
             self._rank = self.accelerator.process_index
             self._world_size = self.accelerator.num_processes
-        elif self.accelerator.num_processes == 1 and self.device_map == "auto":
-            log.info("Using %d devices with pipeline parallelism", self.accelerator.num_processes)
+        elif self.accelerator.num_processes == 1 and self.device_map in ("auto", "balanced"):
+            log.info(
+                "Using %d process(es) with device_map=%s",
+                self.accelerator.num_processes,
+                self.device_map,
+            )
             self._rank = 0
             self._world_size = 1
         else:
@@ -242,6 +250,17 @@ class Model(ABC):
 
         return self._model
 
+    def _get_prepared_model(self) -> torch.nn.Module:
+        """Return the module used for training/inference after ``accelerator.prepare``.
+
+        (e.g. FSDP-wrapped).
+
+        Prefer the stored ``_model`` (possibly wrapped) over :attr:`model`, which unwraps for
+        convenience. ``getattr`` fallback supports edge cases; normal :class:`Model` init always
+        sets ``_model``.
+        """
+        return getattr(self, "_model", self.model)
+
     @property
     def processor(self) -> Any:  # noqa: ANN401
         """Return the model processor."""
@@ -288,6 +307,14 @@ class Model(ABC):
     def load_model(self) -> None:
         """Load the model in memory."""
         raise NotImplementedError
+
+    def _transform_model_before_prepare(self) -> None:  # noqa: B027
+        """Transform the model after load_model() and before accelerator.prepare().
+
+        Subclasses (e.g. Qwen2VL with TTW) override this to apply SVF, PEFT LoRA,
+        or other adapters that must be part of the model graph before FSDP wrapping.
+        """
+        pass
 
     @abstractmethod
     def loglikelihood(self, requests: list[TaskInstance]) -> list[tuple[float, bool]]:
