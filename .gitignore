@@ -169,3 +169,6 @@ config-diff.json
 notebooks/
 .ignore
 plots/
+
+# Large data files
+offline_captions/

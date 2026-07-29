@@ -1,0 +1,6 @@
+system_prompt: You are a helpful assistant.
+user_prompt: "Classify the image.
+
+  Output the thinking process in <think> </think> and the final answer in <answer>
+  </answer> tags. The output answer format should be as follows: <think></think> <answer>a single label
+  or the word 'None' to abstain.</answer>. Please strictly follow the format."
