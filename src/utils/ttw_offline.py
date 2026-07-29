@@ -39,7 +39,7 @@ from src import utils
 log = utils.get_logger(__name__, rank_zero_only=True)
 
 # ---------------------------------------------------------------------------
-# GRPO prompt constants
+# GRPO prompt constants (defaults when no --ttw_grpo_prompt_config is given)
 # ---------------------------------------------------------------------------
 
 _GRPO_SYSTEM_PROMPT = """You are an expert visual reasoner. For every image,
@@ -69,6 +69,50 @@ _GRPO_USER_PROMPT = "Classify the main object in this image."
 
 # Short instruct-system text for offline caption runs that should *not* use the GRPO scratchpad prompt.
 _TTW_VANILLA_SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+# ---------------------------------------------------------------------------
+# GRPO prompt config loader
+# ---------------------------------------------------------------------------
+
+
+def _load_grpo_prompt_config(
+    config_path: str | None,
+) -> tuple[str, str]:
+    """Load system/user prompt pair from a YAML file.
+
+    Falls back to the built-in ``_GRPO_SYSTEM_PROMPT`` / ``_GRPO_USER_PROMPT``
+    when *config_path* is ``None``.
+
+    Args:
+    ----
+        config_path: Path to a YAML file with ``system_prompt`` and ``user_prompt`` keys.
+            See ``configs/grpo_prompts/`` for examples.
+
+    Returns:
+    -------
+        (system_prompt, user_prompt) tuple.
+
+    """
+    if not config_path:
+        return _GRPO_SYSTEM_PROMPT, _GRPO_USER_PROMPT
+
+    import yaml
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    system_prompt = cfg.get("system_prompt")
+    user_prompt = cfg.get("user_prompt")
+
+    if system_prompt is None or user_prompt is None:
+        raise ValueError(
+            f"GRPO prompt config '{config_path}' must contain both "
+            f"'system_prompt' and 'user_prompt' keys. Got: {list(cfg.keys())}"
+        )
+
+    log.info("Loaded GRPO prompt config from %s", config_path)
+    return system_prompt, user_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +314,7 @@ def _make_vllm_backend(args):
     from src.models.ttw import TTW_AUXILIARY_PROMPTS
 
     model_kwargs = utils.parse_string_args(args.model_args)
-    max_model_len = model_kwargs.get("ttw_vllm_max_model_len", 4096)
+    max_model_len = model_kwargs.get("ttw_vllm_max_model_len", 8192)
     gpu_memory_utilization = model_kwargs.get("ttw_vllm_gpu_util", 0.85)
     mm_encoder_attn_backend = model_kwargs.get("ttw_vllm_mm_encoder_attn_backend", "TORCH_SDPA")
     pretrained_path = (
@@ -437,11 +481,19 @@ def generate_offline_captions(args, task_manager, task_names):
 # ---------------------------------------------------------------------------
 
 
-def _build_grpo_parquet(task_obj, docs, split_name, task_name, limit):
+def _build_grpo_parquet(
+    task_obj,
+    docs,
+    split_name,
+    task_name,
+    limit,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+):
     """Build a GRPO parquet dataset from a list of documents.
 
-    Schema matches verl expectations. Prompts follow reward v3: a nested
-    think-block scratchpad plus free-form post-think answer text.
+    Schema matches verl expectations.
 
     Args:
         task_obj: The task object.
@@ -449,6 +501,9 @@ def _build_grpo_parquet(task_obj, docs, split_name, task_name, limit):
         split_name: The name of the split.
         task_name: The name of the task.
         limit: The limit on the number of documents to process.
+        system_prompt: System message text injected into every sample.
+        user_prompt: User message text (``<image>`` tag prepended automatically).
+
     """
     import datasets as hf_datasets
 
@@ -478,12 +533,12 @@ def _build_grpo_parquet(task_obj, docs, split_name, task_name, limit):
                 # DO NOT wrap in hf_datasets.Sequence() — that creates Struct<List>
                 # which pandas returns as {"role": [...], "content": [...]} breaking verl.
                 "prompt": [
-                    {"role": "system", "content": _GRPO_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {
                         "role": "user",
                         # verl splits content on <image> tags to inject images.
                         # Content must be a plain string — NOT a list of dicts.
-                        "content": f"<image>\n{_GRPO_USER_PROMPT}",
+                        "content": f"<image>\n{user_prompt}",
                     },
                 ],
                 "ability": "classification",
@@ -543,6 +598,13 @@ def generate_grpo_dataset(args, task_manager, task_names):
     log.info(f"  Output path: {args.output_path}")
     log.info("=" * 60)
 
+    system_prompt, user_prompt = _load_grpo_prompt_config(
+        getattr(args, "ttw_grpo_prompt_config", None)
+    )
+    log.info(f"  System prompt: {system_prompt[:60]}...")
+    log.info(f"  User prompt:   {user_prompt[:60]}...")
+    log.info("=" * 60)
+
     os.makedirs(args.output_path, exist_ok=True)
 
     for task_name in task_names:
@@ -579,7 +641,13 @@ def generate_grpo_dataset(args, task_manager, task_names):
             log.info("-" * 60)
 
             dataset, n_written = _build_grpo_parquet(
-                task_obj, docs, split_name, task_name, effective_limit
+                task_obj,
+                docs,
+                split_name,
+                task_name,
+                effective_limit,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
             )
 
             if dataset is None:
