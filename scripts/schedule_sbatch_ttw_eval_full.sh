@@ -13,7 +13,7 @@ ttw_validate_restore="${TTW_VALIDATE_RESTORE:-0}"
 model="qwen2-vl-7b-ttw"
 # When eval_limit is empty, run on full dataset; use "full" in experiment name
 limit_suffix="${eval_limit:-full}"
-experiment="ttw_${method}"
+experiment="debug_test_refactor_ttw_${method}"
 wandb_args="${EVAL_WANDB_ARGS:-project=lmms-owc,job_type=eval}"
 # Build --limit arg only when eval_limit is non-empty.
 # When empty, use continuation line (\) so the python command doesn't break.
@@ -30,7 +30,8 @@ else
 fi
 mkdir -p "$log_dir"
 
-EVAL_TASKS="caltech101,dtd,flowers102,oxford_pets,ucf101"
+# EVAL_TASKS="caltech101,dtd,flowers102,oxford_pets,ucf101"
+EVAL_TASKS="oxford_pets"
 # Split comma-separated values into array
 IFS=',' read -ra EVAL_TASKS_ARRAY <<< "$EVAL_TASKS"
 

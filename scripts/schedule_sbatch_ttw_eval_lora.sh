@@ -7,10 +7,19 @@ method="lora"
 num_gpus="${1:-1}"
 # Use $# so '' as 2nd arg means "no limit" (full dataset)
 if [[ $# -ge 2 ]]; then eval_limit="$2"; else eval_limit="4"; fi
-model="qwen2-vl-7b-ttw"
+model="qwen2.5-vl-7b-ttw"
 limit_suffix="${eval_limit:-full}"
-experiment="debug_ttw_peft_test_concurrent_${method}"
+experiment="ttw_${method}"
 wandb_args="${EVAL_WANDB_ARGS:-project=lmms-owc,job_type=eval}"
+MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-}"
+# Optional HF hub id or local path. When unset, omit model_name_or_path from --model_args so
+# qwen2.5-vl-7b-ttw uses its default (Qwen/Qwen2.5-VL-7B-Instruct). Passing model_name_or_path=
+# would parse as empty string and override that default.
+if [[ -n "${MODEL_NAME_OR_PATH}" ]]; then
+    model_path_segment="model_name_or_path=${MODEL_NAME_OR_PATH},"
+else
+    model_path_segment=""
+fi
 # Build --limit arg only when eval_limit is non-empty.
 # When empty, use continuation line (\) so the python command doesn't break.
 if [[ -n "${eval_limit}" ]]; then
@@ -48,7 +57,7 @@ sbatch <<EOT
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:${num_gpus}
-#SBATCH --mem=128G
+#SBATCH --mem=384G
 #SBATCH --time=24:00:00
 #SBATCH --output="${log_dir}/ttw_eval_${method}_${timestamp}_%A_%a.out"
 #SBATCH --error="${log_dir}/ttw_eval_${method}_${timestamp}_%A_%a.err"
@@ -85,6 +94,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Diagnostic: Unsloth internal logging to verify loss path at runtime:
 # export UNSLOTH_ENABLE_LOGGING=1
 
+# Turn off gpu profiling metrics to csv
+export TTW_GPU_MEMORY_CSV=0
+
 # ── CUDA MPS for concurrent TTW warmup workers ──
 export CUDA_MPS_PIPE_DIRECTORY=logs/nvidia-mps-\${SLURM_JOB_ID}
 export CUDA_MPS_LOG_DIRECTORY=logs/nvidia-mps-log-\${SLURM_JOB_ID}
@@ -100,7 +112,7 @@ cleanup_mps() {
 trap cleanup_mps EXIT
 
 # Activate your environment
-source "\$(pwd)"/.venv/bin/activate
+source "\$(pwd)"/.ttw_working_venv/bin/activate
 
 # Calculate the indices based on SLURM_ARRAY_TASK_ID
 TASK_INDEX=\$(( \$SLURM_ARRAY_TASK_ID - 1 ))
@@ -130,7 +142,7 @@ python -m accelerate.commands.launch \\
     --mixed_precision=bf16 \\
     -m eval_model \\
     --model ${model} \\
-    --model_args offline_caption_dir=./offline_captions/,ttw_finetune_method=${method},ttw_lora_backend=peft,ttw_lr=1e-4,ttw_epochs=5,ttw_concurrent_warmups=2 \\
+    --model_args offline_caption_dir=./offline_captions/qwen2.5-vl-7b-ttw,${model_path_segment}ttw_finetune_method=${method},ttw_lora_backend=peft,ttw_lr=1e-4,ttw_epochs=5,ttw_concurrent_warmups=2,ttw_grad_accum=True \\
     --tasks "\${task}" \\
     --output_path "\${EVAL_OUTPUT_DIR}" \\
     --batch_size 1 \\

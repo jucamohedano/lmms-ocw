@@ -9,7 +9,7 @@ num_gpus="${1:-1}"
 if [[ $# -ge 2 ]]; then eval_limit="$2"; else eval_limit="4"; fi
 model="qwen2-vl-7b-ttw"
 limit_suffix="${eval_limit:-full}"
-experiment="ttw_${method}"
+experiment="debug_test_refactor_ttw_${method}"
 wandb_args="${EVAL_WANDB_ARGS:-project=lmms-owc,job_type=eval}"
 # Build --limit arg only when eval_limit is non-empty.
 # When empty, use continuation line (\) so the python command doesn't break.
@@ -26,7 +26,8 @@ else
 fi
 mkdir -p "$log_dir"
 
-EVAL_TASKS="caltech101,dtd,flowers102,oxford_pets,ucf101"
+# EVAL_TASKS="caltech101,dtd,flowers102,oxford_pets,ucf101"
+EVAL_TASKS="oxford_pets"
 # Split comma-separated values into array
 IFS=',' read -ra EVAL_TASKS_ARRAY <<< "$EVAL_TASKS"
 
@@ -57,6 +58,7 @@ sbatch <<EOT
 #
 # Evaluates ${model} on classification tasks using SVF finetuning.
 # Uses DDP (no FSDP). SLURM arrays run one task per job.
+# CUDA MPS + ttw_concurrent_warmups=2: parallel SVF warmup workers share the GPU.
 # -----------------------------------------------------------
 
 # Load the required modules
@@ -72,6 +74,21 @@ export WANDB_MODE=offline
 
 # Reduce CUDA memory fragmentation
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# ── CUDA MPS for concurrent TTW SVF warmup workers ──
+export CUDA_MPS_PIPE_DIRECTORY=logs/nvidia-mps-\${SLURM_JOB_ID}
+export CUDA_MPS_LOG_DIRECTORY=logs/nvidia-mps-log-\${SLURM_JOB_ID}
+mkdir -p \${CUDA_MPS_PIPE_DIRECTORY} \${CUDA_MPS_LOG_DIRECTORY}
+nvidia-cuda-mps-control -d
+echo "CUDA MPS daemon started"
+
+cleanup_mps() {
+    echo quit | nvidia-cuda-mps-control 2>/dev/null || true
+    rm -rf \${CUDA_MPS_PIPE_DIRECTORY} \${CUDA_MPS_LOG_DIRECTORY}
+    echo "CUDA MPS daemon stopped"
+}
+trap cleanup_mps EXIT
 
 # Activate your environment
 source "\$(pwd)"/.venv/bin/activate
@@ -104,7 +121,7 @@ python -m accelerate.commands.launch \\
     --mixed_precision=bf16 \\
     -m eval_model \\
     --model ${model} \\
-    --model_args offline_caption_dir=./offline_captions/,ttw_finetune_method=${method},ttw_svf_rank=-1,ttw_lr=1e-4,ttw_epochs=5 \\
+    --model_args offline_caption_dir=./offline_captions/,ttw_finetune_method=${method},ttw_svf_rank=-1,ttw_lr=1e-4,ttw_epochs=5,ttw_concurrent_warmups=2,ttw_grad_accum=False \\
     --tasks "\${task}" \\
     --output_path "\${EVAL_OUTPUT_DIR}" \\
     --batch_size 1 \\
