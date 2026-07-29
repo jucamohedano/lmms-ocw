@@ -79,12 +79,12 @@ def load_results(experiment_name: str, model: str = None, exclude: str = None):
     for experiment_folder in folders:
         # Get the last file in ascending order, i.e., the most recent one
         # so that we load the most recent experiment for current task
-        last_file = sorted(glob.glob(f"{experiment_folder}/*.json"))[-1]
+        last_file = sorted(glob.glob(f"{experiment_folder}/**/*.json", recursive=True))[-1]
         file_name = Path(last_file).name
         experiment_file_name = file_name.split(".")[0].replace("_results", "")
 
         # Do the same for the samples file, to ensure they match
-        last_file_samples = sorted(glob.glob(f"{experiment_folder}/*.jsonl"))[-1]
+        last_file_samples = sorted(glob.glob(f"{experiment_folder}/**/*.jsonl", recursive=True))[-1]
         file_samples_name = Path(last_file_samples).name
         samples_file_name = file_samples_name[: file_samples_name.find("_samples")]
 
@@ -374,8 +374,10 @@ def main(args):
             print(f"\n--- {metric_name} ---")
             print(tabulate(pivot_df, headers="keys", tablefmt="fancy_grid", showindex=False))
 
-        make_pivot("semantic_similarity", "Semantic Similarity")
-        make_pivot("median_concept_semantic_similarity", "Median Concept Semantic Similarity")
+        make_pivot("textual_inclusion", "Textual Inclusion (Txt Incl)")
+        make_pivot("semantic_similarity", "Semantic Similarity (Sem Sim)")
+        make_pivot("concept_semantic_similarity", "Concept Semantic Similarity (Con Sim)")
+        make_pivot("median_concept_semantic_similarity", "Median Concept Semantic Similarity (Median CS)")
         make_pivot("perplexity", "Perplexity", is_percentage=False, higher_is_better=False)
         return
 

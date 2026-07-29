@@ -705,6 +705,16 @@ if __name__ == "__main__":
             '("You are a helpful assistant.") instead of the GRPO scratchpad system prompt.'
         ),
     )
+    parser.add_argument(
+        "--ttw_grpo_prompt_config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a YAML file with 'system_prompt' and 'user_prompt' keys "
+            "for --ttw_grpo_generate. See configs/grpo_prompts/ for examples. "
+            "When omitted, uses the built-in reward v3 prompt."
+        ),
+    )
     args = parser.parse_args()
 
     main(args)
